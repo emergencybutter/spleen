@@ -13,7 +13,12 @@
 # This is why all the arithmetic expressions end with || :
 set -eu
 
+### Options ###
 enable_debug_messages=false
+
+### Early functions ###
+# Those may be executed before we even validated the version of bash
+# that we're running, so they come before even the constant definitions
 
 function debug_level() {
 	declare level="$1"
@@ -41,11 +46,13 @@ function info() {
 function check_version() {
 	[[ -n "${BASH_VERSION}" ]] || die "$0 needs bash to run"
 	declare -ri bash_major="${BASH_VERSION%%.*}"
-	((bash_major >= 4)) || die "$0 needs bash version 4 or higher"
+	((bash_major >= 3)) || die "$0 needs bash version 3 or higher"
 }
 
-# Check the version before initializing variables. We declare associative arrays that fail on old bash.
+# Check the version before initializing constants.
 check_version
+
+### Constants ###
 
 declare -ri RAX=0
 declare -ri RCX=1
@@ -63,63 +70,6 @@ declare -ri R12=12
 declare -ri R13=13
 declare -ri R14=14
 declare -ri R15=15
-
-function register_name() {
-	declare -ri reg="$1"
-	case $((reg)) in
-	0)
-		echo RAX
-		;;
-	1)
-		echo RCX
-		;;
-	2)
-		echo RDX
-		;;
-	3)
-		echo RBX
-		;;
-	4)
-		echo RSP
-		;;
-	5)
-		echo RBP
-		;;
-	6)
-		echo RSI
-		;;
-	7)
-		echo RDI
-		;;
-	8)
-		echo R8
-		;;
-	9)
-		echo R9
-		;;
-	10)
-		echo R10
-		;;
-	11)
-		echo R11
-		;;
-	12)
-		echo R12
-		;;
-	13)
-		echo R13
-		;;
-	14)
-		echo R14
-		;;
-	15)
-		echo R15
-		;;
-	*)
-		die "Unknown register: %x" $((reg))
-		;;
-	esac
-}
 
 declare -ri MH_MAGIC=$((0xfeedface))
 declare -ri MH_MAGIC_64=$((0xfeedfacf))
@@ -191,54 +141,205 @@ declare -ri WIDTH32=4
 declare -ri WIDTH16=2
 declare -ri WIDTH8=1
 
-declare -A COMMAND_NR_TO_NAME=(
-	[$((0x1))]="LC_SEGMENT"
-	[$((0x2))]="LC_SYMTAB"
-	[$((0x3))]="LC_SYMSEG"
-	[$((0x4))]="LC_THREAD"
-	[$((0x5))]="LC_UNIXTHREAD"
-	[$((0x6))]="LC_LOADFVMLIB"
-	[$((0x7))]="LC_IDFVMLIB"
-	[$((0x8))]="LC_IDENT"
-	[$((0x9))]="LC_FVMFILE"
-	[$((0xa))]="LC_PREPAGE"
-	[$((0xb))]="LC_DYSYMTAB"
-	[$((0xc))]="LC_LOAD_DYLIB"
-	[$((0xd))]="LC_ID_DYLIB"
-	[$((0xe))]="LC_LOAD_DYLINKER"
-	[$((0xf))]="LC_ID_DYLINKER"
-	[$((0x10))]="LC_PREBOUND_DYLIB"
-	[$((0x11))]="LC_ROUTINES"
-	[$((0x12))]="LC_SUB_FRAMEWORK"
-	[$((0x13))]="LC_SUB_UMBRELLA"
-	[$((0x14))]="LC_SUB_CLIENT"
-	[$((0x15))]="LC_SUB_LIBRARY"
-	[$((0x16))]="LC_TWOLEVEL_HINTS"
-	[$((0x17))]="LC_PREBIND_CKSUM"
-	[$((0x19))]="LC_SEGMENT_64"
-	[$((0x1a))]="LC_ROUTINES_64"
-	[$((0x1b))]="LC_UUID"
-	[$((0x1d))]="LC_CODE_SIGNATURE"
-	[$((0x1e))]="LC_SEGMENT_SPLIT_INFO"
-	[$((0x20))]="LC_LAZY_LOAD_DYLIB"
-	[$((0x21))]="LC_ENCRYPTION_INFO"
-	[$((0x22))]="LC_DYLD_INFO"
-	[$((0x22))]="LC_DYLD_INFO_ONLY"
-	[$((0x23))]="LC_LOAD_UPWARD_DYLIB"
-	[$((0x24))]="LC_VERSION_MIN_MACOSX"
-	[$((0x25))]="LC_VERSION_MIN_IPHONEOS"
-	[$((0x26))]="LC_FUNCTION_STARTS"
-	[$((0x27))]="LC_DYLD_ENVIRONMENT"
-	[$((0x28))]="LC_MAIN"
-	[$((0x29))]="LC_DATA_IN_CODE"
-	[$((0x2A))]="LC_SOURCE_VERSION"
-	[$((0x2B))]="LC_DYLIB_CODE_SIGN_DRS"
-)
+### Runtime global variables ###
+
+declare -i GLOBAL_text_vmaddr
+declare -i GLOBAL_entryoff
+declare -i GLOBAL_stacksize
 
 # Insanity
 declare -a memory
 
 declare -a registers
+
+
+function register_name() {
+	declare -ri reg="$1"
+	case $((reg)) in
+	0)
+		echo RAX
+		;;
+	1)
+		echo RCX
+		;;
+	2)
+		echo RDX
+		;;
+	3)
+		echo RBX
+		;;
+	4)
+		echo RSP
+		;;
+	5)
+		echo RBP
+		;;
+	6)
+		echo RSI
+		;;
+	7)
+		echo RDI
+		;;
+	8)
+		echo R8
+		;;
+	9)
+		echo R9
+		;;
+	10)
+		echo R10
+		;;
+	11)
+		echo R11
+		;;
+	12)
+		echo R12
+		;;
+	13)
+		echo R13
+		;;
+	14)
+		echo R14
+		;;
+	15)
+		echo R15
+		;;
+	*)
+		die "Unknown register: %x" $((reg))
+		;;
+	esac
+}
+
+function command_nr_to_name() {
+	case "$1" in
+	$((0x1)))
+		echo "LC_SEGMENT"
+		;;
+	$((0x2)))
+		echo "LC_SYMTAB"
+		;;
+	$((0x3)))
+		echo "LC_SYMSEG"
+		;;
+	$((0x4)))
+		echo "LC_THREAD"
+		;;
+	$((0x5)))
+		echo "LC_UNIXTHREAD"
+		;;
+	$((0x6)))
+		echo "LC_LOADFVMLIB"
+		;;
+	$((0x7)))
+		echo "LC_IDFVMLIB"
+		;;
+	$((0x8)))
+		echo "LC_IDENT"
+		;;
+	$((0x9)))
+		echo "LC_FVMFILE"
+		;;
+	$((0xa)))
+		echo "LC_PREPAGE"
+		;;
+	$((0xb)))
+		echo "LC_DYSYMTAB"
+		;;
+	$((0xc)))
+		echo "LC_LOAD_DYLIB"
+		;;
+	$((0xd)))
+		echo "LC_ID_DYLIB"
+		;;
+	$((0xe)))
+		echo "LC_LOAD_DYLINKER"
+		;;
+	$((0xf)))
+		echo "LC_ID_DYLINKER"
+		;;
+	$((0x10)))
+		echo "LC_PREBOUND_DYLIB"
+		;;
+	$((0x11)))
+		echo "LC_ROUTINES"
+		;;
+	$((0x12)))
+		echo "LC_SUB_FRAMEWORK"
+		;;
+	$((0x13)))
+		echo "LC_SUB_UMBRELLA"
+		;;
+	$((0x14)))
+		echo "LC_SUB_CLIENT"
+		;;
+	$((0x15)))
+		echo "LC_SUB_LIBRARY"
+		;;
+	$((0x16)))
+		echo "LC_TWOLEVEL_HINTS"
+		;;
+	$((0x17)))
+		echo "LC_PREBIND_CKSUM"
+		;;
+	$((0x19)))
+		echo "LC_SEGMENT_64"
+		;;
+	$((0x1a)))
+		echo "LC_ROUTINES_64"
+		;;
+	$((0x1b)))
+		echo "LC_UUID"
+		;;
+	$((0x1d)))
+		echo "LC_CODE_SIGNATURE"
+		;;
+	$((0x1e)))
+		echo "LC_SEGMENT_SPLIT_INFO"
+		;;
+	$((0x20)))
+		echo "LC_LAZY_LOAD_DYLIB"
+		;;
+	$((0x21)))
+		echo "LC_ENCRYPTION_INFO"
+		;;
+	$((0x22)))
+		echo "LC_DYLD_INFO"
+		;;
+	$((0x22)))
+		echo "LC_DYLD_INFO_ONLY"
+		;;
+	$((0x23)))
+		echo "LC_LOAD_UPWARD_DYLIB"
+		;;
+	$((0x24)))
+		echo "LC_VERSION_MIN_MACOSX"
+		;;
+	$((0x25)))
+		echo "LC_VERSION_MIN_IPHONEOS"
+		;;
+	$((0x26)))
+		echo "LC_FUNCTION_STARTS"
+		;;
+	$((0x27)))
+		echo "LC_DYLD_ENVIRONMENT"
+		;;
+	$((0x28)))
+		echo "LC_MAIN"
+		;;
+	$((0x29)))
+		echo "LC_DATA_IN_CODE"
+		;;
+	$((0x2A)))
+		echo "LC_SOURCE_VERSION"
+		;;
+	$((0x2B)))
+		echo "LC_DYLIB_CODE_SIGN_DRS"
+		;;
+	*)
+		echo "UNKOWNN"
+		;;
+	esac
+}
 
 function dump_file() {
 	hexdump -v -e '/1 "%u\n"' /tmp/hi
@@ -354,7 +455,7 @@ function command_name() {
 	if [[ ! ${COMMAND_NR_TO_NAME[${cmd}]+_} ]]; then
 		echo "UNKNOWN"
 	else
-		echo "${COMMAND_NR_TO_NAME[${cmd}]}${req_dyld}"
+		echo "$(command_nr_to_name $((cmd)))${req_dyld}"
 	fi
 }
 
@@ -416,7 +517,7 @@ function consume_segment_64() {
 	debug "	fileoff: %x filesize: %x maxprot: %x nsects: %x flags: %x" \
 		${fileoff} ${filesize} ${maxprot} ${nsects} ${flags}
 	if [[ ${segname} = "__TEXT" ]]; then
-		declare -g text_vmaddr=${vmaddr}
+		((GLOBAL_text_vmaddr=vmaddr))||:
 	fi
 
 	declare -i i
@@ -427,9 +528,9 @@ function consume_segment_64() {
 
 function consume_entry_point() {
 	declare -ri load_command_cmdsize="$1"
-	declare -g entryoff=$(consume_uint64)  # file (__TEXT) offset of main()
-	declare -g stacksize=$(consume_uint64) # if not zero, initial stack size
-	debug "Found entry point: ${entryoff}"
+	declare GLOBAL_entryoff=$(consume_uint64)  # file (__TEXT) offset of main()
+	declare GLOBAL_stacksize=$(consume_uint64) # if not zero, initial stack size
+	debug "Found entry point: ${GLOBAL_entryoff}"
 }
 
 function consume_command() {
@@ -733,7 +834,7 @@ function inst_syscall_write() {
 }
 
 function run() {
-	declare -i rip=$((text_vmaddr + entryoff))
+	declare -i rip=$((GLOBAL_text_vmaddr + GLOBAL_entryoff))
 	declare -i rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
 
 	while true; do
