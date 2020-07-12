@@ -830,7 +830,7 @@ function inst_syscall_write() {
 		string="${string}$(printf '\\x%x' $(get_memory 1 $((buf + i))))"
 	done
 	debug "SYSCALL WRITE: %x %x %x %s" $((out_fd)) $((buf)) $((len)) "${string}"
-	printf "${string}"
+	printf "${string}" >&${out_fd}
 }
 
 function run() {
