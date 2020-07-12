@@ -342,13 +342,13 @@ function command_nr_to_name() {
 }
 
 function dump_file() {
-	hexdump -v -e '/1 "%u\n"' /tmp/hi
+	hexdump -v -e '/1 "%u\n"' "${binary_file}"
 }
 
 function dump_at() {
 	declare -ri offset="$1"
 	declare -ri size="$2"
-	hexdump -v -e '/1 "%u\n"' /tmp/hi | (
+	hexdump -v -e '/1 "%u\n"' "${binary_file}" | (
 		consume "${offset}"
 		head -n "${size}"
 	)
@@ -528,8 +528,8 @@ function consume_segment_64() {
 
 function consume_entry_point() {
 	declare -ri load_command_cmdsize="$1"
-	declare GLOBAL_entryoff=$(consume_uint64)  # file (__TEXT) offset of main()
-	declare GLOBAL_stacksize=$(consume_uint64) # if not zero, initial stack size
+	GLOBAL_entryoff=$(consume_uint64)  # file (__TEXT) offset of main()
+	GLOBAL_stacksize=$(consume_uint64) # if not zero, initial stack size
 	debug "Found entry point: ${GLOBAL_entryoff}"
 }
 
@@ -935,8 +935,7 @@ function init() {
 }
 
 function main() {
-	gcc -o /tmp/hi hi.c
-
+	declare -r binary_file="$1"
 	dump_file | (
 		init
 		load_macho_file
@@ -975,5 +974,6 @@ function run_tests() {
 	test_set_get_memory
 }
 
-run_tests
-main
+# run_tests
+
+main "$@"
