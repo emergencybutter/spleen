@@ -1,4 +1,4 @@
-# Spleen.bash
+# Spleen.bash - An x86_64 emulator written in bash
 
 Spleen.bash is a x86_64 CPU emulator written in bash.
 
