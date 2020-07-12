@@ -344,15 +344,15 @@ function dump_at() {
 	declare -ri offset="$1"
 	declare -ri size="$2"
 	hexdump -v -e '/1 "%u\n"' "${binary_file}" | (
-		consume "${offset}"
-		head -n "${size}"
+		consume $((offset))
+		head -n $((size))
 	)
 }
 
 function consume_uint8() {
 	declare -i i0
 	read i0
-	echo "${i0}"
+	echo $((i0))
 }
 
 function print_le32() {
@@ -372,7 +372,7 @@ function consume_uint32() {
 	read i1
 	read i2
 	read i3
-	print_le32 "${i0}" "${i1}" "${i2}" "${i3}"
+	print_le32 $((i0)) $((i1)) $((i2)) $((i3))
 }
 
 function consume_vmprot_t() {
@@ -393,7 +393,7 @@ function consume_string() {
 			# To convert an integer to the corresponding ascii character in bash,
 			# we use printf '\x123' where 123 is an hex representation of the integer.
 			# We generate the '\x123' string with a printf. Everything is fine.
-			printf "$(printf '\\x%x' ${i0})"
+			printf "$(printf '\\x%x' $((i0)))"
 		fi
 	done
 }
@@ -406,7 +406,7 @@ function consume_uint64() {
 	if (((i1 & (1 << 31)) == 0)); then
 		echo $((i0 | i1 << 32))
 	else
-		echo "(2^32)*${i1} + ${i0}" | bc -l
+		echo "(2^32)*$((i1)) + $((i0))" | bc -l
 	fi
 }
 
@@ -447,11 +447,7 @@ function command_name() {
 		((cmd = cmd & ~LC_REQ_DYLD)) || :
 		req_dyld="|LC_REQ_DYLD"
 	fi
-	if [[ ! ${COMMAND_NR_TO_NAME[${cmd}]+_} ]]; then
-		echo "UNKNOWN"
-	else
-		echo "$(command_nr_to_name $((cmd)))${req_dyld}"
-	fi
+	echo "$(command_nr_to_name $((cmd)))${req_dyld}"
 }
 
 function consume() {
@@ -480,13 +476,12 @@ function consume_section_64() {
 		$((addr)) $((size)) $((offset)) $((align))
 
 	if [[ "${segname}" = __TEXT ]]; then
-		typeset -i i="${vmaddr}"
+		typeset -i i=$((vmaddr))
 		typeset -i value
 		while read value; do
-			#printf "loading %x at %x\n" ${value} $((offset + i))
-			memory[$((i + offset))]=${value}
+			memory[$((i + offset))]=$((value))
 			((i++)) || :
-		done < <(dump_at "${offset}" "${size}")
+		done < <(dump_at $((offset)) $((size)))
 	else
 		debug "Not loading: ${segname}.${sectname} vmaddr: %x offset: %x\n" \
 			$((vmaddr)) $((offset))
@@ -508,16 +503,16 @@ function consume_segment_64() {
 	declare -ri flags=$(consume_uint32)      # flags
 
 	debug "SEGMENT: ${segname} vmaddr: %x vmsize: %x" \
-		${vmaddr} ${vmsize}
+		$((vmaddr)) $((vmsize))
 	debug "	fileoff: %x filesize: %x maxprot: %x nsects: %x flags: %x" \
-		${fileoff} ${filesize} ${maxprot} ${nsects} ${flags}
+		$((fileoff)) $((filesize)) $((maxprot)) $((nsects)) $((flags))
 	if [[ ${segname} = "__TEXT" ]]; then
 		((GLOBAL_text_vmaddr = vmaddr)) || :
 	fi
 
 	declare -i i
 	for ((i = 0; i < nsects; i++)); do
-		consume_section_64 ${i}
+		consume_section_64 $((i))
 	done
 }
 
@@ -525,7 +520,7 @@ function consume_entry_point() {
 	declare -ri load_command_cmdsize="$1"
 	GLOBAL_entryoff=$(consume_uint64)  # file (__TEXT) offset of main()
 	GLOBAL_stacksize=$(consume_uint64) # if not zero, initial stack size
-	debug "Found entry point: ${GLOBAL_entryoff}"
+	debug "Found entry point: %x" $((GLOBAL_entryoff))
 }
 
 function consume_command() {
@@ -537,14 +532,14 @@ function consume_command() {
 	debug "Command: ${load_command_cmd}: $(command_name "${load_command_cmd}") ${LC_MAIN}"
 
 	case ${load_command_cmd} in
-	${LC_SEGMENT_64})
-		consume_segment_64 "${load_command_cmdsize}"
+	$((LC_SEGMENT_64)))
+		consume_segment_64 $((load_command_cmdsize))
 		;;
-	${LC_MAIN})
-		consume_entry_point "${load_command_cmdsize}"
+	$((LC_MAIN)))
+		consume_entry_point $((load_command_cmdsize))
 		;;
 	*)
-		consume "$((load_command_cmdsize - 8))"
+		consume $((load_command_cmdsize - 8))
 		;;
 	esac
 }
@@ -552,7 +547,7 @@ function consume_command() {
 function inst_push() {
 	declare -i reg="$1"
 	((registers[${RSP}] -= 8)) || :
-	memory[${registers[${RSP}]}]=${registers[${reg}]}
+	((memory[registers[RSP]]=registers[reg])) || :
 }
 
 function unknown_insruction() {
@@ -563,25 +558,25 @@ function unknown_insruction() {
 
 # Modifies variables `displacement` and `advance`
 function disp32() {
-	declare -ri i0=${memory[$((rip + advance))]}
-	declare -ri i1=${memory[$((rip + advance + 1))]}
-	declare -ri i2=${memory[$((rip + advance + 2))]}
-	declare -ri i3=${memory[$((rip + advance + 3))]}
+	declare -ri i0=$((memory[rip + advance]))
+	declare -ri i1=$((memory[rip + advance + 1]))
+	declare -ri i2=$((memory[rip + advance + 2]))
+	declare -ri i3=$((memory[rip + advance + 3]))
 	((advance += 4)) || :
-	displacement=$(print_le32 "${i0}" "${i1}" "${i2}" "${i3}")
+	displacement=$(print_le32 $((i0)) $((i1)) $((i2)) $((i3)))
 }
 
 # Modifies variables `displacement` and `advance`
 function disp16() {
-	declare -ri i0=${memory[$((rip + advance))]}
-	declare -ri i1=${memory[$((rip + advance + 1))]}
+	declare -ri i0=$((memory[rip + advance]))
+	declare -ri i1=$((memory[rip + advance + 1]))
 	((advance += 2)) || :
-	displacement=$(print_le16 "${i0}" "${i1}")
+	displacement=$(print_le16 $((i0)) $((i1)))
 }
 
 # Modifies variables `displacement` and `advance`
 function disp8() {
-	declare -ri i0=${memory[$((rip + advance))]}
+	declare -ri i0=$((memory[rip + advance]))
 	((advance += 1)) || :
 	((displacement = i0)) || :
 }
@@ -681,16 +676,16 @@ function set_register() {
 		$(register_name $((reg))) $((value)) $((width))
 	case $((width)) in
 	1)
-		registers[$((reg))]=$((registers[reg] & (~0 << 8) | (value & 0xff)))
+		((registers[reg]=registers[reg] & (~0 << 8) | (value & 0xff) )) || :
 		;;
 	2)
-		registers[$((reg))]=$((registers[reg] & (~0 << 16) | (value & 0xffff)))
+		((registers[reg]=registers[reg] & (~0 << 16) | (value & 0xffff) )) || :
 		;;
 	4)
-		registers[$((reg))]=$((registers[reg] & (~0 << 32) | (value & 0xfffffff)))
+		((registers[reg]=registers[reg] & (~0 << 32) | (value & 0xfffffff) )) || :
 		;;
 	8)
-		registers[$((reg))]=$((value))
+		((registers[reg]=value)) || :
 		;;
 	*)
 		die "Unsupported data width in set_register: ${width}"
@@ -712,7 +707,7 @@ function set_memory() {
 	)
 	declare -i i
 	for ((i = 0; i < width; i++)); do
-		memory[address + i]=${value_bytes[i]}
+		((memory[address + i]=value_bytes[i]))
 	done
 }
 
@@ -895,7 +890,7 @@ function run() {
 		case $((instruction & 0xF0)) in
 		$((0x30)))
 			if (((instruction & 0xF) < 5)); then
-				declare -i modrm=${memory[$((rip + advance))]}
+				declare -i modrm=$((memory[rip + advance]))
 				((advance++)) || :
 				inst_binary_op binary_op_xor $((instruction)) $((modrm))
 			else
