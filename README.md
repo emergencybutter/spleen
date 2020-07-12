@@ -4,12 +4,12 @@ Spleen.bash is a x86_64 CPU emulator written in bash.
 
 ## Overview
 
-spleen.bash is a bash script that loads an OSX binary (called Mach-O binaries) from disk and run the binary without resorting to executing native code on host machine.
-Consequently you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
+spleen.bash is a bash script that loads an x86_64 OSX binary from disk and run the binary without executing native code on host machine.
+Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
 
 ## Example
 
-``` shell
+```shell
 $ uname -a
 Linux contrib-stretch 4.9.0-12-amd64 #1 SMP Debian 4.9.210-1 (2020-01-20) x86_64 GNU/Linux
 $ file examples-bin/hi 
@@ -37,7 +37,7 @@ Hello World!
 Currently, spleen.bash supports only the instructions needed to run the single provide example.
 For reference, here is the program that `spleen.bash` can run:
 
-``` shell
+```shell
 nohar@pro ~/projects/hate% objdump -d examples-bin/hi
 
 examples-bin/hi:     file format mach-o-x86-64
@@ -76,7 +76,7 @@ Luxe, calme et volupté.
 
 ### Ok, seriouly though, why?
 
-I came across a [awk-jvm](https://github.com/rethab/awk-jvm), a jvm implemented in awk. I first though this was the most useless thing ever. But then, I figure I could probably write something even more useless. So I had to do it.
+I came across a [awk-jvm](https://github.com/rethab/awk-jvm), a jvm implemented in awk. I chuckled and thought that this was the most useless thing ever made. Unfortunately, I then figured that I could probably write something even more useless. ```can + shouldn't = must```.
 
 ### Is everything ok?
 
@@ -88,7 +88,7 @@ I tested with bash 3 and 5.
 
 ### Why is there a binary in your git repository?
 
-The emulator supports a limited number of instructions. It's fairly possible that compiler change (or even some compiler options) generate an unsupported binary. The provided binary has been tested to work. You can validate that it corresponds to the namesake C file by running `objdump -d ./examples-bin/hi` and reading the assembly code.
+The emulator supports a limited number of instructions. It's fairly possible that a simple compiler change (or even some compiler options) would generate an unsupported binary. The provided binary has been tested to work. You can validate that it corresponds to the namesake C file by running `objdump -d ./examples-bin/hi` and reading the assembly code.
 
 ### Why and OSX binary (Mach-O)?
 
