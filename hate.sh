@@ -4,6 +4,8 @@
 # OR we go the wrong route and assume all the uint64 values we manipulate are smaller than INT64_MAX
 # Obviously we're following the way of the YOLO. I'm writing a x86 emulator in bash after all.
 
+# set -e generally allows to detect programming mistakes early. However it does not play well with arightmetic expressions. With arithmetic expressions, a line like `((a=b&0x1))` will evaluate to false if a results to 0. This would terminate the program with set -e.
+# This is why all the arithmetic expressions end with ||:
 set -eu
 
 enable_debug_messages=false
@@ -282,7 +284,7 @@ function consume_string() {
 	for ((i=0; i<size; i++)); do
 		declare -i i0
 		read i0
-		if (( i0 == 0 )) ; then
+		if ((i0 == 0)) ; then
 			print=false
 		fi
 		if [[ ${print} == true ]] ; then
@@ -326,9 +328,9 @@ function load_macho_file() {
 	declare -ri mach_header_flags=$(consume_uint32)
 	declare -ri mach_header_reserved=$(consume_uint32)
 
-	(( mach_header_magic == MH_MAGIC_64 )) || \
+	((mach_header_magic == MH_MAGIC_64)) || \
 		die "Can't find magic number"
-	(( mach_header_filetype == MH_EXECUTE )) || \
+	((mach_header_filetype == MH_EXECUTE)) || \
 		die "Unknown filetype"
 	declare -i i
 	for ((i=0; i<mach_header_ncmds; i++)); do
@@ -339,8 +341,8 @@ function load_macho_file() {
 function command_name() {
 	typeset -i cmd="$1"
 	typeset req_dyld=""
-	if (( cmd & LC_REQ_DYLD )) ; then
-		((cmd=cmd & ~LC_REQ_DYLD))
+	if ((cmd & LC_REQ_DYLD)) ; then
+		((cmd=cmd & ~LC_REQ_DYLD))||:
 		req_dyld="|LC_REQ_DYLD"
 	fi
 	if [[ ! ${COMMAND_NR_TO_NAME[${cmd}]+_} ]] ; then
@@ -381,7 +383,7 @@ function consume_section_64() {
 		while read value; do
 			#printf "loading %x at %x\n" ${value} $((offset + i))
 			memory[$((i + offset))]=${value}
-			((i++))
+			((i++))||:
 		done < <(dump_at "${offset}" "${size}")
 	else
 		debug "Not loading: ${segname}.${sectname} vmaddr: %x offset: %x\n" \
@@ -448,7 +450,7 @@ function consume_command() {
 
 function inst_push() {
 	declare -i reg="$1"
-	(( registers[${RSP}] -= 8 ))
+	(( registers[${RSP}] -= 8 ))||:
 	memory[${registers[${RSP}]}]=${registers[${reg}]}
 }
 
@@ -464,7 +466,7 @@ function disp32() {
 	declare -ri i1=${memory[$((rip+advance+1))]}
 	declare -ri i2=${memory[$((rip+advance+2))]}
 	declare -ri i3=${memory[$((rip+advance+3))]}
-	((advance+=4))
+	((advance+=4))||:
 	displacement=$(print_le32 "${i0}" "${i1}" "${i2}" "${i3}")
 }
 
@@ -472,15 +474,15 @@ function disp32() {
 function disp16() {
 	declare -ri i0=${memory[$((rip+advance))]}
 	declare -ri i1=${memory[$((rip+advance+1))]}
-	((advance+=2))
+	((advance+=2))||:
 	displacement=$(print_le16 "${i0}" "${i1}")
 }
 
 # Modifies variables `displacement` and `advance`
 function disp8() {
 	declare -ri i0=${memory[$((rip+advance))]}
-	(( advance+=1))
-	(( displacement=i0 ))
+	((advance+=1))||:
+	((displacement=i0))||:
 }
 
 # Modifies variables `displacement` and `advance`
@@ -506,9 +508,9 @@ function disp_width() {
 # Sets modrm_mod modrm_rm modrm_reg modrm_address
 function operands_modrm() {
 	declare -i modrm="$1"
-	modrm_mod=$(( modrm >> 6 & 0x3 ))
+	modrm_mod=$((modrm >> 6 & 0x3))
 	modrm_reg=$(((modrm >> 3) & 0x7  | rex_b << 3))
-	modrm_rm=$(( (modrm) & 0x7  | rex_r << 3))
+	modrm_rm=$(((modrm) & 0x7  | rex_r << 3))
 	modrm_address=0
 
 	case $((modrm_mod)) in
@@ -573,18 +575,18 @@ function operands_modrm() {
 
 function set_register() {
 	declare -ri width="$1" reg="$2" value="$3"
-	case $(( width )) in
+	case $((width)) in
 	(1)
-		registers[$((reg))]=$(( registers[reg] & (~0 << 8) | (value & 0xff) ))
+		registers[$((reg))]=$((registers[reg] & (~0 << 8) | (value & 0xff) ))
 		;;
 	(2)
-		registers[$((reg))]=$(( registers[reg] & (~0 << 16) | (value & 0xffff) ))
+		registers[$((reg))]=$((registers[reg] & (~0 << 16) | (value & 0xffff) ))
 		;;
 	(4)
-		registers[$((reg))]=$(( registers[reg] & (~0 << 32) | (value & 0xfffffff) ))
+		registers[$((reg))]=$((registers[reg] & (~0 << 32) | (value & 0xfffffff) ))
 		;;
 	(8)
-		registers[$((reg))]=$(( value ))
+		registers[$((reg))]=$((value ))
 		;;
 	(*)
 		die "Unsupported data width in set_register: ${width}"
@@ -636,7 +638,7 @@ function get_memory() {
 	declare -i value=0
 	declare -i i
 	for (( i=0; i < width; i++)) ; do
-		(( value+=memory[address+i] << (8*i) ))
+		((value+=memory[address+i] << (8*i) ))||:
 	done
 	echo $(( value ))
 }
@@ -655,10 +657,10 @@ function get_width() {
 function inst_mov() {
 	declare -i mov="$1"
 	declare -i modrm="$2"
-	declare -i direction=$(( (mov >> 1) & 0x1 ))
-	declare -i width_is_byte=$(( mov & 0x1 ))
+	declare -i direction=$(((mov >> 1) & 0x1))
+	declare -i width_is_byte=$((mov & 0x1))
 
-	declare -i width=$(( width_is_byte ? WIDTH8 : $(get_width) ))
+	declare -i width=$((width_is_byte ? WIDTH8 : $(get_width) ))
 
 	declare -i modrm_mod modrm_reg modrm_rm modrm_address
 	operands_modrm $((modrm))
@@ -732,37 +734,37 @@ function run() {
 	while true; do
 		declare -i prefix_set=0
 		declare -i advance=1
-		declare -i instruction=$(( memory[rip] ))
+		declare -i instruction=$((memory[rip]))
 
-		case $(( instruction & 0xF0 )) in
-		( $((0x50)) )
-			inst_push $(( instruction & 0x0F ))
+		case $((instruction & 0xF0)) in
+		($((0x50)))
+			inst_push $((instruction & 0x0F))
 			;;
-		( $((0x40)) )
-			(( rex=instruction ))
-			(( rex_w=rex >> 3 & 0x1))
-			(( rex_r=rex >> 2 & 0x1))
-			(( rex_x=rex >> 1 & 0x1))
-			(( rex_b=rex & 0x1))
-			(( prefix_set=1 ))
+		($((0x40)))
+			((rex=instruction))||:
+			((rex_w=rex >> 3 & 0x1))||:
+			((rex_r=rex >> 2 & 0x1))||:
+			((rex_x=rex >> 1 & 0x1))||:
+			((rex_b=rex & 0x1))||:
+			((prefix_set=1))||:
 			;;
-		( $((0x60 )) )
-			case $(( instruction )) in
+		($((0x60)))
+			case $((instruction)) in
 			(0x66)
-				operand_size_prefix=$(( instruction ))
+				operand_size_prefix=$((instruction))
 				;;
 			esac
 			;;
-		( $((0x80)) )
-			case $(( instruction & 0xF )) in
-			( $((0x9)) )
+		($((0x80)))
+			case $((instruction & 0xF)) in
+			($((0x9)))
 				declare -i modrm=${memory[$((rip + advance))]}
-				((advance++))
+				((advance++))||:
 				inst_mov $((instruction)) $((modrm))
 				;;
-			( $((0xd)) )
+			($((0xd)))
 				declare -i modrm=${memory[$((rip + advance))]}
-				((advance++))
+				((advance++))||:
 				inst_lea $((instruction)) $((modrm))
 				;;
 			(*)
@@ -770,21 +772,21 @@ function run() {
 				;;
 			esac
 			;;
-		( $((0xb0)) )
+		($((0xb0)))
 			declare -i width
-			if (( instruction & 0xF < 8 )) ; then
-				(( width=WIDTH8 ))
+			if ((instruction & 0xF < 8)) ; then
+				((width=WIDTH8))||:
 			else
 				width=$(get_width)
 			fi
 			inst_mov_imm $((instruction))
 			;;
 		($((0)))
-			case $(( instruction )) in
+			case $((instruction)) in
 			($((0x0f)))
 				declare -i instruction_byte_2=${memory[$((rip+advance))]}
-				((advance++))
-				case $(( instruction_byte_2 )) in
+				((advance++))||:
+				case $((instruction_byte_2)) in
 				($((0x05)))
 					inst_syscall
 					;;
@@ -801,12 +803,12 @@ function run() {
 			;;
 		esac
 
-		(( rip+=advance ))
-		(( advance=1 ))
+		((rip+=advance))||:
+		((advance=1))||:
 
 		# Reset prefix variable unless we just set a prefix
-		if (( prefix_set )) ; then
-			(( prefix_set=0 ))
+		if ((prefix_set)) ; then
+			((prefix_set=0))||:
 		else
 			rex=0
 			rex_w=0
@@ -826,40 +828,38 @@ function init() {
 	registers[${RSP}]=$((0x10000))
 }
 
-function main2() {
-	init
-	load_macho_file
-	run
-}
-
 function main() {
 	gcc -o /tmp/hi hi.c
 	
-	dump_file | main2 || die "hi"
+	dump_file | (
+		init
+		load_macho_file
+		run
+	)
 }
 
 function test_set_get_register() {
-	set_register 1 $(( RAX )) 128
-	test $(get_register 1 $(( RAX )) ) = 128 || die "$(get_register 1 $(( RAX )) ) is not 128"
+	set_register 1 $((RAX)) 128
+	test $(get_register 1 $((RAX)) ) = 128 || die "$(get_register 1 $((RAX)) ) is not 128"
 
-	set_register 2 $(( RBX )) 0xabcd
-	set_register 1 $(( RBX )) 0xef
-	test $(get_register 2 $(( RBX )) ) = $(( 0xabef )) || \
-		die "%02x is not 0xabef" $(get_register 2 $(( RBX )))
+	set_register 2 $((RBX)) 0xabcd
+	set_register 1 $((RBX)) 0xef
+	test $(get_register 2 $((RBX)) ) = $((0xabef)) || \
+		die "%02x is not 0xabef" $(get_register 2 $((RBX)))
 }
 
 function test_set_get_memory() {
 	set_memory 1 123456789 128
-	test $(get_memory 1 123456789 ) = 128 || die "$(get_memory 1 123456789 ) is not 128"
+	test $(get_memory 1 123456789) = 128 || die "$(get_memory 1 123456789 ) is not 128"
 
 	set_memory 2 123456789 0xabcd
 	set_memory 1 123456789 0xef
-	test $(get_memory 2 123456789 ) = $(( 0xabef )) || \
+	test $(get_memory 2 123456789) = $((0xabef)) || \
 		die "%02x is not 0xabef" $(get_memory 2 123456789)
 
 	set_memory 8 123456789 $((0x1234567abcdef01))
 	set_memory 1 123456790 0xff
-	test $(get_memory 8 123456789 ) = $(( 0x1234567abcdff01 )) || \
+	test $(get_memory 8 123456789) = $((0x1234567abcdff01)) || \
 		die "%02x is not 0x1234567abcdff01" $(get_memory 8 123456789)
 }
 
