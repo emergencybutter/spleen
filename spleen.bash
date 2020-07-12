@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 # bash integer type is a signed int64 so unsigned int32 fits. unsigned 64 does
 # not, so we should avoid doing shell arithmetic evaluation and resort to
