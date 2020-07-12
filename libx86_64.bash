@@ -14,7 +14,7 @@
 set -eu
 
 ### Options ###
-enable_debug_messages=true
+enable_debug_messages=false
 
 ### Early functions ###
 # Those may be executed before we even validated the version of bash
@@ -480,7 +480,7 @@ function consume_section_64() {
 	typeset -ri reserved2=$(consume_uint32)  # reserved (for count or sizeof)
 	typeset -ri reserved3=$(consume_uint32)  # reserved
 
-	info "Segment.Section: ${segname}.${sectname} addr: %x size: %x offset: %x align: %x" \
+	debug "Segment.Section: ${segname}.${sectname} addr: %x size: %x offset: %x align: %x" \
 		$((addr)) $((size)) $((offset)) $((align))
 
 	if [[ "${segname}" = __TEXT ]]; then
@@ -853,8 +853,11 @@ function inst_mov_imm() {
 
 # This function is basically an OSX kernel emulator written in bash.
 function inst_syscall() {
-	debug "Syscall: %0x\n" ${registers[$((RAX))]}
-	case ${registers[$((RAX))]} in
+	debug "Syscall: %0x\n" $((registers[RAX]))
+	case $((registers[RAX])) in
+	$((0x02000001)))
+		inst_syscall_exit
+		;;
 	$((0x02000004)))
 		inst_syscall_write
 		;;
@@ -865,9 +868,9 @@ function inst_syscall() {
 }
 
 function inst_syscall_write() {
-	declare -ri out_fd=${registers[$((RDI))]}
-	declare -ri buf=${registers[$((RSI))]}
-	declare -ri len=${registers[$((RDX))]}
+	declare -ri out_fd=$((registers[RDI]))
+	declare -ri buf=$((registers[RSI]))
+	declare -ri len=$((registers[RDX]))
 	declare -i i
 	declare string=
 
@@ -876,6 +879,12 @@ function inst_syscall_write() {
 	done
 	debug "SYSCALL WRITE: %x %x %x %s" $((out_fd)) $((buf)) $((len)) "${string}"
 	printf "${string}" >&${out_fd}
+}
+
+function inst_syscall_exit() {
+	declare -ri exit_code=$((registers[RDX]))
+	debug "SYSCALL EXIT: exitting with code: %x" $((exit_code))
+	exit $((exit_code))
 }
 
 function run() {
