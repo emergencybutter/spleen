@@ -6,11 +6,29 @@
 
 set -eu
 
+enable_debug_messages=false
+
+function debug_level() {
+	declare level="$1"
+	declare format="$2"
+	if [[ ${level} = "DEBUG" && ! "${enable_debug_messages}" = true ]] ; then
+		return
+	fi
+	shift 2
+	printf "${level}: ${format}\n" "$@" >&2
+}
+
 function die() {
-	declare format="$1"
-	shift
-	printf "${format}\n" "$@"
-	exit 1
+	debug_level FATAL_ERROR "$@"
+	exit 127
+}
+
+function debug() {
+	debug_level "DEBUG" "$@"
+}
+
+function info() {
+	debug_level "INFO" "$@"
 }
 
 function check_version() {
@@ -214,9 +232,10 @@ declare -A COMMAND_NR_TO_NAME=(
 
 # Insanity
 declare -a memory
+
 declare -a registers
 
-function dump() {
+function dump_file() {
 	hexdump -v -e '/1 "%u\n"' /tmp/hi
 }
 
@@ -287,7 +306,7 @@ function consume_uint64() {
 	fi
 }
 
-function header() {
+function load_macho_file() {
 	#struct mach_header_64 {
 	#	uint32_t      magic;
 	#	cpu_type_t    cputype;
@@ -313,7 +332,6 @@ function header() {
 		die "Unknown filetype"
 	declare -i i
 	for ((i=0; i<mach_header_ncmds; i++)); do
-		echo "Loading command $i"
 		consume_command
 	done
 }
@@ -326,9 +344,10 @@ function command_name() {
 		req_dyld="|LC_REQ_DYLD"
 	fi
 	if [[ ! ${COMMAND_NR_TO_NAME[${cmd}]+_} ]] ; then
-		die "${cmd}${req_dyld} is not a known command number."
+		echo "UNKNOWN"
+	else
+		echo "${COMMAND_NR_TO_NAME[${cmd}]}${req_dyld}"
 	fi
-	echo "${COMMAND_NR_TO_NAME[${cmd}]}${req_dyld}"
 }
 
 function consume() {
@@ -353,18 +372,20 @@ function consume_section_64() {
 	typeset -ri reserved2=$(consume_uint32)  # reserved (for count or sizeof)
 	typeset -ri reserved3=$(consume_uint32)  # reserved
 
-	printf "$sectname $segname addr: %x size: %x offset: %x align: %x\n" $addr $size $offset $align
+	info "Segment.Section: ${segname}.${sectname} addr: %x size: %x offset: %x align: %x" \
+		$((addr)) $((size)) $((offset)) $((align))
 
-	if [[ "${sectname}" = __text && "${segname}" = __TEXT ]] ; then
+	if [[ "${segname}" = __TEXT ]] ; then
 		typeset -i i="${vmaddr}"
 		typeset -i value
 		while read value; do
-			printf "loading %x at %x\n" ${value} $((offset + i))
+			#printf "loading %x at %x\n" ${value} $((offset + i))
 			memory[$((i + offset))]=${value}
 			((i++))
 		done < <(dump_at "${offset}" "${size}")
-		printf "reading %x\n" $((offset + vmaddr))
-		printf '>%x %x\n' ${memory[$((offset + vmaddr))]} ${memory[$((offset + vmaddr + 1))]}
+	else
+		debug "Not loading: ${segname}.${sectname} vmaddr: %x offset: %x\n" \
+			$((vmaddr)) $((offset))
 	fi
 }
 
@@ -382,8 +403,10 @@ function consume_segment_64() {
 	declare -ri nsects=$(consume_uint32)  # number of sections in segment
 	declare -ri flags=$(consume_uint32)  # flags
 
-	printf "${segname} vmaddr: %x vmsize: %x fileoff:%x filesize:%x maxprot: %x nsects: %x flags: %x\n" \
-		${vmaddr} ${vmsize} ${fileoff} ${filesize} ${maxprot} ${nsects} ${flags}
+	debug "SEGMENT: ${segname} vmaddr: %x vmsize: %x" \
+		${vmaddr} ${vmsize}
+	debug "	fileoff: %x filesize: %x maxprot: %x nsects: %x flags: %x" \
+		${fileoff} ${filesize} ${maxprot} ${nsects} ${flags}
 	if [[ ${segname} = "__TEXT" ]] ; then
 		declare -g text_vmaddr=${vmaddr}
 	fi
@@ -399,7 +422,7 @@ function consume_entry_point() {
 	declare -ri load_command_cmdsize="$1"
 	declare -g entryoff=$(consume_uint64)  # file (__TEXT) offset of main() 
 	declare -g stacksize=$(consume_uint64)  # if not zero, initial stack size
-	echo "Found entry point: ${entryoff}"
+	debug "Found entry point: ${entryoff}"
 }
 
 function consume_command() {
@@ -408,7 +431,7 @@ function consume_command() {
 
 	declare req_dyld=""
 
-	echo "Command: ${load_command_cmd}: $(command_name "${load_command_cmd}") ${LC_MAIN}"
+	debug "Command: ${load_command_cmd}: $(command_name "${load_command_cmd}") ${LC_MAIN}"
 
 	case ${load_command_cmd} in
 	(${LC_SEGMENT_64})
@@ -432,8 +455,7 @@ function inst_push() {
 function unknown_insruction() {
 	declare instruction="$1"
 	declare msg="$2"
-	printf "Unknown instruction at 0x%x: ${instruction} (${msg})\n" "${rip}" 1>&2
-	exit 1
+	die "Unknown instruction at 0x%x: ${instruction} (${msg})\n" $((rip))
 }
 
 # Modifies variables `displacement` and `advance`
@@ -444,7 +466,6 @@ function disp32() {
 	declare -ri i3=${memory[$((rip+advance+3))]}
 	((advance+=4))
 	displacement=$(print_le32 "${i0}" "${i1}" "${i2}" "${i3}")
-	printf "Computed displacement: %0x" $((displacement))
 }
 
 # Modifies variables `displacement` and `advance`
@@ -502,10 +523,13 @@ function operands_modrm() {
 		($((RBP)))
 			declare -i displacement
 			disp32
-			modrm_address=$((rip + displacement))
+			# RIP addressing, we add the displacement to rip *after* the current instruction.
+			# disp32 already modified `advance`, so adding advance should point to the next
+			# instruction.
+			modrm_address=$((rip + displacement + advance))
 			;;
 		(*)
-			modrm_address=${registers[modrm_rm]}
+			modrm_address=$((registers[modrm_rm]))
 			;;
 		esac
 		;;
@@ -520,7 +544,7 @@ function operands_modrm() {
 		(*)
 			declare -i displacement
 			disp8
-			modrm_address=$((${registers[modrm_rm]} + displacement))
+			modrm_address=$((registers[modrm_rm] + displacement))
 			;;
 		esac
 		;;
@@ -535,7 +559,7 @@ function operands_modrm() {
 		(*)
 			declare -i displacement
 			disp32
-			modrm_address=$((${registers[modrm_rm]} + displacement))
+			modrm_address=$((registers[modrm_rm] + displacement))
 			;;
 		esac
 		;;
@@ -549,7 +573,6 @@ function operands_modrm() {
 
 function set_register() {
 	declare -ri width="$1" reg="$2" value="$3"
-	printf "Setting register %s to value %x\n" $(register_name $((reg))) $((value))
 	case $(( width )) in
 	(1)
 		registers[$((reg))]=$(( registers[reg] & (~0 << 8) | (value & 0xff) ))
@@ -642,14 +665,14 @@ function inst_mov() {
 
 	case $((modrm_mod)) in
 	(3)
-		if $(( direction )); then
+		if (( direction )); then
 			set_register $((width)) $((modrm_reg)) "$(get_register $((width)) $((modrm_rm)))"
 		else
 			set_register $((width)) $((modrm_rm)) "$(get_register $((width)) $((modrm_reg)))"
 		fi
 		;;
 	(*)
-		if $(( direction )); then
+		if (( direction )); then
 			set_register $((width)) $((modrm_reg)) "$(get_memory $((width)) $((modrm_address)))"
 		else
 			set_memory $((width)) $((modrm_address)) "$(get_register $((width)) $((modrm_reg)))"
@@ -671,14 +694,35 @@ function inst_mov_imm() {
 	declare -ri mov="$1"
 	declare -ri reg=$((mov & 0x7 | rex_b << 3))
 	declare -i displacement
-	echo "mov imm %x %x" $((rip)) $((advance))
 	disp_width $((width))
 	set_register $((width)) $((reg)) $((displacement))
 }
 
+# This function is basically an OSX kernel emulator written in bash.
 function inst_syscall() {
-	printf "Syscall: %0x\n" ${registers[$((RAX))]}
-	die "Called my first syscall"
+	debug "Syscall: %0x\n" ${registers[$((RAX))]}
+	case ${registers[$((RAX))]} in
+	($((0x02000004)))
+		inst_syscall_write
+		;;
+	(*)
+		die "Unimplemented syscall"
+		;;
+	esac
+}
+
+function inst_syscall_write() {
+	declare -ri out_fd=${registers[$((RDI))]}
+	declare -ri buf=${registers[$((RSI))]}
+	declare -ri len=${registers[$((RDX))]}
+	declare -i i
+	declare string=
+
+	for ((i=0; i < len; i++)); do
+		string="${string}$(printf '\\x%x' $(get_memory 1 $((buf+i))))"
+	done
+	debug "SYSCALL WRITE: %x %x %x %s" $((out_fd)) $((buf)) $((len)) "${string}"
+	printf "${string}"
 }
 
 function run() {
@@ -688,12 +732,11 @@ function run() {
 	while true; do
 		declare -i prefix_set=0
 		declare -i advance=1
-		declare -i instruction=${memory[$((rip))]}
-		printf "mem[%x]=%x\n" ${rip} ${instruction}
+		declare -i instruction=$(( memory[rip] ))
 
 		case $(( instruction & 0xF0 )) in
 		( $((0x50)) )
-			inst_push $((instruction & 0x0F))
+			inst_push $(( instruction & 0x0F ))
 			;;
 		( $((0x40)) )
 			(( rex=instruction ))
@@ -704,9 +747,9 @@ function run() {
 			(( prefix_set=1 ))
 			;;
 		( $((0x60 )) )
-			case $((instruction)) in
+			case $(( instruction )) in
 			(0x66)
-				operand_size_prefix=$((instruction))
+				operand_size_prefix=$(( instruction ))
 				;;
 			esac
 			;;
@@ -721,7 +764,6 @@ function run() {
 				declare -i modrm=${memory[$((rip + advance))]}
 				((advance++))
 				inst_lea $((instruction)) $((modrm))
-				echo "lea advance: $advance"
 				;;
 			(*)
 				unknown_insruction "$(printf '%02x' $((instruction)) )" "maybe a mov"
@@ -745,6 +787,7 @@ function run() {
 				case $(( instruction_byte_2 )) in
 				($((0x05)))
 					inst_syscall
+					;;
 				(*)
 					die "Unsupported 2 byte instruction: %02x%02x"\
 						 $((instruction)) $((instruction_byte_2))
@@ -752,12 +795,12 @@ function run() {
 				esac
 				;;
 			esac
+			;;
 		(*)
 			die "Unsupported instruction: 0x%x" $((instruction))
 			;;
 		esac
 
-		echo "advance: $advance"
 		(( rip+=advance ))
 		(( advance=1 ))
 
@@ -783,9 +826,16 @@ function init() {
 	registers[${RSP}]=$((0x10000))
 }
 
+function main2() {
+	init
+	load_macho_file
+	run
+}
+
 function main() {
 	gcc -o /tmp/hi hi.c
-	dump | (init; header; run) || echo "bad stuf happened and you don't get to have a proper error message."
+	
+	dump_file | main2 || die "hi"
 }
 
 function test_set_get_register() {
