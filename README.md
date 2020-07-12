@@ -1,10 +1,10 @@
-# Spleen.bash - An x86_64 emulator written in bash
+# Spleen - An x86_64 emulator written in bash
 
-Spleen.bash is a x86_64 CPU emulator written in bash.
+Spleen is a x86_64 CPU emulator written in bash.
 
 ## Overview
 
-spleen.bash is a bash script that loads an x86_64 OSX binary from disk and run the binary without executing native code on host machine.
+Spleen is a bash script that loads an x86_64 OSX binary from disk and run the binary without executing native code on host machine.
 Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
 
 ## Example
@@ -34,7 +34,7 @@ Hello World!
 
 ## Supported instructions
 
-Currently, spleen.bash supports only the instructions needed to run the single provide example.
+Currently, spleen supports only the instructions needed to run the single provide example.
 For reference, here is the program that `spleen.bash` can run:
 
 ```shell
