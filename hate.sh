@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 
-# bash integer type is a signed int64 so unsigned int32 fits. unsigned 64 does not, so we should avoid doing shell arithmetic evaluation and resort to calling out to bc.
-# OR we go the wrong route and assume all the uint64 values we manipulate are smaller than INT64_MAX
-# Obviously we're following the way of the YOLO. I'm writing a x86 emulator in bash after all.
+# bash integer type is a signed int64 so unsigned int32 fits. unsigned 64 does
+# not, so we should avoid doing shell arithmetic evaluation and resort to
+# calling out to bc.  OR we go the wrong route and assume all the uint64 values
+# we manipulate are smaller than INT64_MAX Obviously we're following the way of
+# the YOLO. I'm writing a x86 emulator in bash after all.
 
-# set -e generally allows to detect programming mistakes early. However it does not play well with arightmetic expressions. With arithmetic expressions, a line like `((a=b&0x1))` will evaluate to false if a results to 0. This would terminate the program with set -e.
-# This is why all the arithmetic expressions end with ||:
+# set -e generally allows to detect programming mistakes early. However it does
+# not play well with arightmetic expressions. With arithmetic expressions, a
+# line like `((a=b&0x1))` will evaluate to false if a results to 0. This would
+# terminate the program with set -e.
+# This is why all the arithmetic expressions end with || :
 set -eu
 
 enable_debug_messages=false
