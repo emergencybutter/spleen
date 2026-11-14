@@ -61,6 +61,15 @@ Disassembly of section .text:
    100000f9c:   c3                      retq
 ```
 
+## System calls
+
+The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `linux` for Linux binaries; set by the binary loader).
+
+* macOS: `write` (0x2000004) and `exit` (0x2000001).
+* Linux x86_64 (number in `rax`, arguments in `rdi rsi rdx r10 r8 r9`, result or negative errno in `rax`, `rcx`/`r11` clobbered):
+  `read` (fd 0 only), `write`/`writev` (fd 1 and 2), `close`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous only, bump allocator), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getpid`, `gettid`, `getuid`, `getgid`, `geteuid`, `getegid`, `uname`, `arch_prctl` (FS/GS base is only stored), `set_tid_address`, `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
+  Unimplemented Linux syscalls return `-ENOSYS` (visible with `enable_debug_messages=true`), since libc start-up code probes optional syscalls.
+
 ## Technical notes
 
 * `split.bash` uses hexdump to read the binary and transform it in something bash can load. Bash cannot natively deal with binary files that may have zeros in them. Apart from that, I don't call external binaries for anything, everything is bash.

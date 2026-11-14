@@ -143,6 +143,23 @@ declare -i GLOBAL_text_vmaddr
 declare -i GLOBAL_entryoff
 declare -i GLOBAL_stacksize
 
+# Operating system ABI of the loaded binary: "macos" (default) or "linux".
+# Selects the system call table used by the `syscall` instruction. Binary
+# loaders are expected to set it (e.g. an ELF loader sets it to "linux").
+declare GLOBAL_os_abi="${GLOBAL_os_abi:-macos}"
+
+# Linux emulation state.
+# GLOBAL_linux_brk_start: initial program break. A loader should set it to the
+# (page aligned) end of the loaded image; 0 means use LINUX_DEFAULT_BRK_START.
+declare -i GLOBAL_linux_brk_start=0
+declare -i GLOBAL_linux_brk=0 # current program break, 0 = not initialised yet
+# Next address handed out by anonymous mmap (bump allocator, never reused).
+declare -i GLOBAL_linux_mmap_next=$((0x7f0000000000))
+# FS/GS segment bases as set by arch_prctl. Nothing uses them for memory
+# addressing (yet); they are only stored.
+declare -i GLOBAL_fs_base=0
+declare -i GLOBAL_gs_base=0
+
 # Insanity
 declare -a memory
 
@@ -707,7 +724,7 @@ function set_memory() {
 	)
 	declare -i i
 	for ((i = 0; i < width; i++)); do
-		((memory[address + i]=value_bytes[i]))
+		((memory[address + i]=value_bytes[i])) || :
 	done
 }
 
@@ -842,8 +859,22 @@ function inst_mov_imm() {
 	set_register $((width)) $((reg)) $((displacement))
 }
 
-# This function is basically an OSX kernel emulator written in bash.
 function inst_syscall() {
+	case "${GLOBAL_os_abi}" in
+	macos)
+		syscall_macos
+		;;
+	linux)
+		syscall_linux
+		;;
+	*)
+		die "Unknown GLOBAL_os_abi: '%s' (expected macos or linux)" "${GLOBAL_os_abi}"
+		;;
+	esac
+}
+
+# This function is basically an OSX kernel emulator written in bash.
+function syscall_macos() {
 	debug "Syscall: %0x\n" $((registers[RAX]))
 	case $((registers[RAX])) in
 	$((0x02000001)))
@@ -876,6 +907,352 @@ function inst_syscall_exit() {
 	declare -ri exit_code=$((registers[RDX]))
 	debug "SYSCALL EXIT: exitting with code: %x" $((exit_code))
 	exit $((exit_code))
+}
+
+### Linux kernel emulation ###
+
+declare -ri LINUX_EPERM=1
+declare -ri LINUX_EBADF=9
+declare -ri LINUX_ENOMEM=12
+declare -ri LINUX_EFAULT=14
+declare -ri LINUX_ENODEV=19
+declare -ri LINUX_EINVAL=22
+declare -ri LINUX_ENOTTY=25
+declare -ri LINUX_ENOSYS=38
+
+declare -ri LINUX_PAGE_SIZE=4096
+declare -ri LINUX_DEFAULT_BRK_START=$((0x10000000))
+declare -ri LINUX_MAP_FIXED=$((0x10))
+declare -ri LINUX_MAP_ANONYMOUS=$((0x20))
+declare -ri LINUX_ARCH_SET_GS=$((0x1001))
+declare -ri LINUX_ARCH_SET_FS=$((0x1002))
+declare -ri LINUX_ARCH_GET_FS=$((0x1003))
+declare -ri LINUX_ARCH_GET_GS=$((0x1004))
+# Value stored in r11 by `syscall`. spleen does not emulate RFLAGS yet, so we
+# report IF set plus the always-one reserved bit 1.
+declare -ri LINUX_SYSCALL_RFLAGS=$((0x202))
+
+# Writes `len` bytes of emulated memory starting at `address` to stdout, byte
+# for byte. NUL bytes, newlines, '%' and '\' are all emitted verbatim.
+function print_memory_bytes() {
+	declare -ri address="$1" len="$2"
+	declare -i i
+	declare escaped="" byte
+	for ((i = 0; i < len; i++)); do
+		printf -v byte '\\x%02x' $((${memory[address + i]:-0} & 0xff))
+		escaped="${escaped}${byte}"
+	done
+	printf '%b' "${escaped}"
+}
+
+# Copies `string` to emulated memory at `address`, followed by NUL bytes up to
+# `size` bytes in total. The string is truncated to size - 1 bytes.
+function set_memory_string() {
+	declare -ri address="$1"
+	declare -r string="$2"
+	declare -ri size="$3"
+	declare LC_ALL=C
+	declare -i i code
+	for ((i = 0; i < size; i++)); do
+		if ((i < ${#string} && i < size - 1)); then
+			printf -v code '%d' "'${string:i:1}"
+			memory[address + i]=$((code & 0xff))
+		else
+			memory[address + i]=0
+		fi
+	done
+}
+
+# Zeroes emulated memory in [address, address + len). Memory is a sparse
+# array, so only the bytes that were ever written need clearing.
+function zero_memory_range() {
+	declare -ri address="$1" len="$2"
+	declare -i i
+	for i in "${!memory[@]}"; do
+		if ((i >= address && i < address + len)); then
+			unset 'memory[i]'
+		fi
+	done
+}
+
+# Sets `now_sec` and `now_nsec` to the current wall clock time.
+function linux_time_now() {
+	if [[ -n "${EPOCHREALTIME:-}" ]]; then
+		declare -r usec="${EPOCHREALTIME#*[.,]}"
+		now_sec=$((${EPOCHREALTIME%[.,]*}))
+		now_nsec=$((10#${usec} * 1000))
+	else
+		now_sec=$(date +%s)
+		now_nsec=0
+	fi
+}
+
+# read(fd, buf, count): only fd 0 is supported. Reads at most `count` bytes
+# from stdin, returning early after a newline (like a terminal would), or at
+# end of file.
+function linux_sys_read() {
+	declare -ri fd="$1" buf="$2" count="$3"
+	if ((fd != 0)); then
+		ret=-LINUX_EBADF
+		return
+	fi
+	declare LC_ALL=C
+	declare -i n=0 code
+	declare c
+	while ((n < count)); do
+		# With -d '' a NUL byte acts as the delimiter, and reads as "".
+		IFS= read -r -n 1 -d '' c || break
+		printf -v code '%d' "'${c}"
+		memory[buf + n]=$((code & 0xff))
+		((n++)) || :
+		if ((code == 10)); then
+			break
+		fi
+	done
+	ret=$((n))
+}
+
+# write(fd, buf, count) for fd 1 (stdout) and 2 (stderr).
+function linux_sys_write() {
+	declare -ri fd="$1" buf="$2" count="$3"
+	case $((fd)) in
+	1 | 2)
+		print_memory_bytes $((buf)) $((count)) >&$((fd))
+		ret=$((count))
+		;;
+	*)
+		ret=-LINUX_EBADF
+		;;
+	esac
+}
+
+# writev(fd, iov, iovcnt). struct iovec { void *iov_base; size_t iov_len; }
+function linux_sys_writev() {
+	declare -ri fd="$1" iov="$2" iovcnt="$3"
+	if ((fd != 1 && fd != 2)); then
+		ret=-LINUX_EBADF
+		return
+	fi
+	declare -i i base len total=0
+	for ((i = 0; i < iovcnt; i++)); do
+		base=$(get_memory 8 $((iov + 16 * i)))
+		len=$(get_memory 8 $((iov + 16 * i + 8)))
+		print_memory_bytes $((base)) $((len)) >&$((fd))
+		((total += len)) || :
+	done
+	ret=$((total))
+}
+
+# brk(addr): returns the new program break, or the current one if `addr` is 0
+# or below the initial break. Memory is sparse, so growing needs no work;
+# shrinking zeroes the released bytes so that growing again reads zeros.
+function linux_sys_brk() {
+	declare -ri addr="$1"
+	if ((GLOBAL_linux_brk_start == 0)); then
+		GLOBAL_linux_brk_start=$((LINUX_DEFAULT_BRK_START))
+	fi
+	if ((GLOBAL_linux_brk == 0)); then
+		GLOBAL_linux_brk=$((GLOBAL_linux_brk_start))
+	fi
+	if ((addr >= GLOBAL_linux_brk_start)); then
+		if ((addr < GLOBAL_linux_brk)); then
+			zero_memory_range $((addr)) $((GLOBAL_linux_brk - addr))
+		fi
+		GLOBAL_linux_brk=$((addr))
+	fi
+	ret=$((GLOBAL_linux_brk))
+}
+
+# mmap(addr, length, prot, flags, fd, offset): anonymous mappings only.
+# Without MAP_FIXED, memory comes from a bump allocator and is never reused.
+function linux_sys_mmap() {
+	declare -ri addr="$1" length="$2" prot="$3" flags="$4" fd="$5" offset="$6"
+	if ((length <= 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	if (((flags & LINUX_MAP_ANONYMOUS) == 0)); then
+		debug "mmap: file backed mappings are not supported (fd %d)" $((fd))
+		ret=-LINUX_ENODEV
+		return
+	fi
+	declare -ri size=$(((length + LINUX_PAGE_SIZE - 1) & ~(LINUX_PAGE_SIZE - 1)))
+	if ((flags & LINUX_MAP_FIXED)); then
+		if ((addr & (LINUX_PAGE_SIZE - 1))); then
+			ret=-LINUX_EINVAL
+			return
+		fi
+		zero_memory_range $((addr)) $((size))
+		ret=$((addr))
+		return
+	fi
+	if ((GLOBAL_linux_mmap_next + size > 0x7ffffffff000)); then
+		ret=-LINUX_ENOMEM
+		return
+	fi
+	ret=$((GLOBAL_linux_mmap_next))
+	((GLOBAL_linux_mmap_next += size)) || :
+}
+
+# uname(buf): struct utsname has 6 fields of 65 bytes each.
+function linux_sys_uname() {
+	declare -ri buf="$1"
+	declare -ri field=65
+	set_memory_string $((buf + 0 * field)) "Linux" $((field))
+	set_memory_string $((buf + 1 * field)) "spleen" $((field))
+	set_memory_string $((buf + 2 * field)) "6.1.0-spleen" $((field))
+	set_memory_string $((buf + 3 * field)) "#1 SMP bash" $((field))
+	set_memory_string $((buf + 4 * field)) "x86_64" $((field))
+	set_memory_string $((buf + 5 * field)) "(none)" $((field))
+	ret=0
+}
+
+function linux_sys_arch_prctl() {
+	declare -ri code="$1" addr="$2"
+	ret=0
+	case $((code)) in
+	$((LINUX_ARCH_SET_FS)))
+		GLOBAL_fs_base=$((addr))
+		;;
+	$((LINUX_ARCH_SET_GS)))
+		GLOBAL_gs_base=$((addr))
+		;;
+	$((LINUX_ARCH_GET_FS)))
+		set_memory 8 $((addr)) $((GLOBAL_fs_base))
+		;;
+	$((LINUX_ARCH_GET_GS)))
+		set_memory 8 $((addr)) $((GLOBAL_gs_base))
+		;;
+	*)
+		ret=-LINUX_EINVAL
+		;;
+	esac
+}
+
+# clock_gettime(clockid, tp): every clock reads the wall clock.
+function linux_sys_clock_gettime() {
+	declare -ri clockid="$1" tp="$2"
+	declare -i now_sec now_nsec
+	linux_time_now
+	set_memory 8 $((tp)) $((now_sec))
+	set_memory 8 $((tp + 8)) $((now_nsec))
+	ret=0
+}
+
+# gettimeofday(tv, tz): tz is ignored.
+function linux_sys_gettimeofday() {
+	declare -ri tv="$1"
+	declare -i now_sec now_nsec
+	linux_time_now
+	if ((tv)); then
+		set_memory 8 $((tv)) $((now_sec))
+		set_memory 8 $((tv + 8)) $((now_nsec / 1000))
+	fi
+	ret=0
+}
+
+# time(tloc)
+function linux_sys_time() {
+	declare -ri tloc="$1"
+	declare -i now_sec now_nsec
+	linux_time_now
+	if ((tloc)); then
+		set_memory 8 $((tloc)) $((now_sec))
+	fi
+	ret=$((now_sec))
+}
+
+# Linux x86_64 system calls. The number is in rax, arguments in rdi, rsi, rdx,
+# r10, r8 and r9. The result goes to rax, a negative errno on failure. Like
+# the real `syscall` instruction, rcx receives the return rip and r11 rflags.
+#
+# Unknown system calls return -ENOSYS (and print a DEBUG message) rather than
+# aborting: libc start-up code routinely probes for optional system calls and
+# copes with ENOSYS.
+function syscall_linux() {
+	declare -ri nr=${registers[RAX]:-0}
+	declare -ri a0=${registers[RDI]:-0}
+	declare -ri a1=${registers[RSI]:-0}
+	declare -ri a2=${registers[RDX]:-0}
+	declare -ri a3=${registers[R10]:-0}
+	declare -ri a4=${registers[R8]:-0}
+	declare -ri a5=${registers[R9]:-0}
+	declare -i ret=0
+
+	debug "Linux syscall %d (%x, %x, %x, %x, %x, %x)" \
+		$((nr)) $((a0)) $((a1)) $((a2)) $((a3)) $((a4)) $((a5))
+
+	case $((nr)) in
+	0) # read
+		linux_sys_read $((a0)) $((a1)) $((a2))
+		;;
+	1) # write
+		linux_sys_write $((a0)) $((a1)) $((a2))
+		;;
+	3) # close
+		if ((a0 >= 0 && a0 <= 2)); then ret=0; else ret=-LINUX_EBADF; fi
+		;;
+	9) # mmap
+		linux_sys_mmap $((a0)) $((a1)) $((a2)) $((a3)) $((a4)) $((a5))
+		;;
+	10 | 11) # mprotect, munmap: nothing to do, memory is not protected
+		ret=0
+		;;
+	12) # brk
+		linux_sys_brk $((a0))
+		;;
+	13 | 14) # rt_sigaction, rt_sigprocmask: signals are never delivered
+		ret=0
+		;;
+	16) # ioctl: no file descriptor is a terminal
+		ret=-LINUX_ENOTTY
+		;;
+	20) # writev
+		linux_sys_writev $((a0)) $((a1)) $((a2))
+		;;
+	39 | 186) # getpid, gettid
+		ret=$$
+		;;
+	60 | 231) # exit, exit_group
+		debug "SYSCALL EXIT: exiting with code: %d" $((a0 & 0xff))
+		exit $((a0 & 0xff))
+		;;
+	63) # uname
+		linux_sys_uname $((a0))
+		;;
+	96) # gettimeofday
+		linux_sys_gettimeofday $((a0))
+		;;
+	102) # getuid
+		ret=${UID}
+		;;
+	107) # geteuid
+		ret=${EUID}
+		;;
+	104 | 108) # getgid, getegid
+		ret=${GROUPS[0]:-0}
+		;;
+	158) # arch_prctl
+		linux_sys_arch_prctl $((a0)) $((a1))
+		;;
+	201) # time
+		linux_sys_time $((a0))
+		;;
+	218) # set_tid_address: returns the thread id
+		ret=$$
+		;;
+	228) # clock_gettime
+		linux_sys_clock_gettime $((a0)) $((a1))
+		;;
+	*)
+		debug "Unimplemented Linux syscall %d, returning -ENOSYS" $((nr))
+		ret=-LINUX_ENOSYS
+		;;
+	esac
+
+	registers[RAX]=$((ret))
+	registers[RCX]=$((${rip:-0} + ${advance:-0}))
+	registers[R11]=$((LINUX_SYSCALL_RFLAGS))
 }
 
 function run() {
@@ -990,9 +1367,13 @@ function init() {
 
 function main() {
 	declare -r binary_file="$1"
-	dump_file | (
-		init
-		load_macho_file
-		run
-	)
+	# The binary reaches the loader through a pipe that replaces stdin. Keep
+	# the original stdin on fd 3 and give it back to the emulated program.
+	{
+		dump_file | (
+			init
+			load_macho_file
+			run 0<&3 3<&-
+		)
+	} 3<&0
 }
