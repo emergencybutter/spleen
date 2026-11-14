@@ -52,6 +52,60 @@ function check_version() {
 # Check the version before initializing constants.
 check_version
 
+# Fallback to POSIX `od` when `hexdump` (bsdextrautils/util-linux) is missing.
+if ! command -v hexdump >/dev/null 2>&1; then
+	function hexdump() {
+		declare -i skip=0 canonical=0
+		declare len="" fmt=""
+		declare -a files=() od_args=(-An -v)
+		while (($# > 0)); do
+			case "$1" in
+			-v) shift ;;
+			-C)
+				canonical=1
+				shift
+				;;
+			-s)
+				skip=$(($2))
+				shift 2
+				;;
+			-n)
+				len="$2"
+				shift 2
+				;;
+			-e)
+				fmt="$2"
+				shift 2
+				;;
+			--)
+				shift
+				files+=("$@")
+				break
+				;;
+			-*) shift ;;
+			*)
+				files+=("$1")
+				shift
+				;;
+			esac
+		done
+		((skip > 0)) && od_args+=(-j "${skip}")
+		[[ -n "${len}" ]] && od_args+=(-N "${len}")
+		if ((canonical)); then
+			od "${od_args[@]}" -t x1 -w16 "${files[@]}"
+		elif [[ "${fmt}" == *"%02x"* ]]; then
+			od "${od_args[@]}" -t x1 "${files[@]}" | tr -d '[:space:]'
+		elif [[ "${fmt}" == *'/1 "%u\n"'* ]]; then
+			od "${od_args[@]}" -t u1 -w1 "${files[@]}"
+		elif [[ "${fmt}" == *'/1 "%u "'* && "${fmt}" == *'\n'* ]]; then
+			declare chunk="${fmt%%/1*}"
+			od "${od_args[@]}" -t u1 -w"${chunk}" "${files[@]}"
+		else
+			od "${od_args[@]}" -t u1 "${files[@]}" | tr '\n' ' '
+		fi
+	}
+fi
+
 ### Constants ###
 
 declare -ri RAX=0
@@ -690,6 +744,7 @@ function load_file_slice_to_memory() {
 	declare -i addr=$((dst_addr))
 	declare line
 	while IFS= read -r line || [[ -n "${line}" ]]; do
+		line="${line#"${line%%[![:space:]]*}"}"
 		[[ -z "${line}" ]] && continue
 		eval "memory+=([${addr}]=${line})"
 		((addr += chunk)) || :
