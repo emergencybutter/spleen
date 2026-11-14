@@ -4,7 +4,7 @@ Spleen is a x86_64 CPU emulator written in bash.
 
 ## Overview
 
-Spleen is a bash script that loads an x86_64 OSX binary from disk and run the binary without executing native code on host machine.
+Spleen is a bash script that loads an x86_64 OSX (Mach-O) or Linux (ELF) binary from disk and run the binary without executing native code on host machine.
 Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
 
 ## Example
@@ -24,7 +24,9 @@ Hello World!
 
 `` ` ./run-examples.sh` ``
 
-* Rebuild the examples from C on an OSX machine with:
+* Rebuild the examples with the command below. The Mach-O examples (`examples/*.c`) are only built on an OSX machine,
+  the Linux ELF examples (`examples/*.S`) are built with `cc -nostdlib -static -no-pie` on Linux
+  (or with the cross compiler given in `LINUX_CC`):
 
 `` ` ./gen-examples.sh` ``
 
@@ -32,10 +34,45 @@ Hello World!
 
 `` ` ./run-tests.bash` ``
 
+## Supported binary formats
+
+The format is detected from the magic number of the binary.
+
+* **Mach-O** (`0xfeedfacf`): 64 bit `MH_EXECUTE` OSX executables, entry point from `LC_MAIN`. Only `__TEXT` is loaded.
+* **ELF** (`0x7f 'E' 'L' 'F'`): `ELFCLASS64`, little endian, `EM_X86_64` executables.
+  * `ET_EXEC` binaries are loaded at their link addresses; `ET_DYN` (static-pie) binaries at the fixed base `0x555555554000`.
+    Note that spleen does not apply relocations, a static-pie binary has to relocate itself.
+  * Every `PT_LOAD` segment is mapped at `p_vaddr` (`p_filesz` bytes copied from the file, zero filled up to `p_memsz`).
+  * Dynamically linked binaries (with a `PT_INTERP` program header) are refused: link with `-static` and without libc.
+  * The initial stack follows the SysV ABI: `argc`, `argv` (the binary path and extra arguments given to `spleen.bash`),
+    an empty `envp` and a minimal auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`...).
+
+The loader sets `GLOBAL_os_abi` to `macos` or `linux` so that the syscall emulation knows which kernel ABI to emulate.
+`examples/hi-linux.S` is a static, libc free Linux "Hello World!" (`examples-bin/hi-linux`).
+
 ## Supported instructions
 
-Currently, spleen supports only the instructions needed to run the single provide example.
-For reference, here is the program that `spleen.bash` can run:
+Spleen implements the integer subset of x86_64 typically emitted by a C compiler
+(`-O0`, `-O1`, `-Os`, no SSE/x87):
+
+* Arithmetic/logic: `add`, `or`, `adc`, `sbb`, `and`, `sub`, `xor`, `cmp` in all
+  their encodings (`00`-`3D`, `80`/`81`/`83`), `test`, `inc`, `dec`, `neg`, `not`,
+  `mul`, `imul` (1, 2 and 3 operands), `div`, `idiv` (including 128 bit dividends).
+* Shifts and rotates: `shl`/`sal`, `shr`, `sar`, `rol`, `ror`, `rcl`, `rcr`, `shld`, `shrd`.
+* Bit scan: `bsf`, `bsr`.
+* Data movement: `mov` (all forms, including `movabs`), `movzx`, `movsx`, `movsxd`,
+  `lea`, `push`, `pop`, `xchg`, `cbw`/`cwde`/`cdqe`, `cwd`/`cdq`/`cqo`, `cmovcc`, `setcc`,
+  `movs` and `stos` (with `rep`).
+* Control flow: `jmp` (rel8, rel32, indirect), `jcc` (rel8, rel32), `call` (rel32,
+  indirect), `ret`, `leave`.
+* Misc: `nop` (including multi-byte `0f 1f` forms), `endbr64`, `syscall`, `clc`, `stc`,
+  `cmc`, `cld`, `std`.
+* Flags: CF, PF, AF, ZF, SF, OF are computed (DF is honored by string instructions).
+* Addressing: all ModRM/SIB forms, RIP-relative addressing, REX prefixes, 8-bit
+  registers (`AH`-`BH` without REX, `SPL`-`DIL` with REX), operand size prefix.
+
+`run-tests.bash` contains unit tests for these instructions. For reference, here is
+the example program that `spleen.bash` runs:
 
 ```shell
 nohar@pro ~/projects/hate% objdump -d examples-bin/hi
@@ -60,6 +97,15 @@ Disassembly of section .text:
    100000f9b:   5d                      pop    %rbp
    100000f9c:   c3                      retq
 ```
+
+## System calls
+
+The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `linux` for Linux binaries; set by the binary loader).
+
+* macOS: `write` (0x2000004) and `exit` (0x2000001).
+* Linux x86_64 (number in `rax`, arguments in `rdi rsi rdx r10 r8 r9`, result or negative errno in `rax`, `rcx`/`r11` clobbered):
+  `read` (fd 0 only), `write`/`writev` (fd 1 and 2), `close`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous only, bump allocator), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getpid`, `gettid`, `getuid`, `getgid`, `geteuid`, `getegid`, `uname`, `arch_prctl` (FS/GS base is only stored), `set_tid_address`, `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
+  Unimplemented Linux syscalls return `-ENOSYS` (visible with `enable_debug_messages=true`), since libc start-up code probes optional syscalls.
 
 ## Technical notes
 
@@ -92,7 +138,7 @@ The emulator supports a limited number of instructions. It's fairly possible tha
 
 ### Why and OSX binary (Mach-O)?
 
-I was on a mac when I had this terrible idea.
+I was on a mac when I had this terrible idea. Linux ELF binaries are now supported as well.
 
 ### Will you support more instructions, CPUs, binary formats?
 
