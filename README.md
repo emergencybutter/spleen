@@ -123,7 +123,7 @@ The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `li
 
 ## Technical notes
 
-* `split.bash` uses hexdump to read the binary and transform it in something bash can load. Bash cannot natively deal with binary files that may have zeros in them. Apart from that, I don't call external binaries for anything, everything is bash.
+* `libx86_64.bash` uses `hexdump` to read the binary and transform it in something bash can load. Bash cannot natively deal with binary files that may have zeros in them. When `hexdump` is not installed, a small shim falls back to POSIX `od`. Apart from that, I don't call external binaries for anything, everything is bash.
 * The RAM is emulated as an array of bytes, which in bash is an array if `integers` which are actually 64 bits, at least on my machine. `` `declare -ra memory` ``.
 * `spleen.bash` uses dynamic scoping. meaning subfunction can alter the local variables of the parent (calling) functions.
 
@@ -144,16 +144,24 @@ I'm well thanks.
 
 ### Which bash version do I need?
 
-I tested with bash 3 and 5.
+Bash 3 or later (the script checks and refuses to run otherwise). I tested with bash 3 and 5.
 
-### Why is there a binary in your git repository?
+### What else do I need?
 
-The emulator supports a limited number of instructions. It's fairly possible that a simple compiler change (or even some compiler options) would generate an unsupported binary. The provided binary has been tested to work. You can validate that it corresponds to the namesake C file by running `objdump -d ./examples-bin/hi` and reading the assembly code.
+Just bash and either `hexdump` or `od` to read the binary. `hexdump` is used when available; on systems without it (e.g. minimal Debian images where it lives in `bsdextrautils`), spleen falls back to `od`, which is part of POSIX coreutils and present pretty much everywhere.
 
-### Why and OSX binary (Mach-O)?
+### Why are there binaries in your git repository?
 
-I was on a mac when I had this terrible idea. Linux ELF binaries are now supported as well.
+The emulator does not support every instruction, and building the Mach-O example requires a mac. It's fairly possible that a simple compiler change (or even some compiler options) would generate an unsupported binary. The provided binaries (`examples-bin/hi` for OSX, `examples-bin/hi-linux` for Linux) have been tested to work. You can validate that they correspond to their namesake source files (`examples/hi.c`, `examples/hi-linux.S`) by running `objdump -d` on them and reading the assembly code.
+
+### Why an OSX binary (Mach-O)?
+
+I was on a mac when I had this terrible idea. Linux ELF binaries are now supported as well, including static, static-pie and dynamically linked ones (spleen loads `ld-linux` and lets it do the linking).
+
+### Can it run real programs?
+
+Somewhat. The integer instruction set, the SSE/SSE2 subset that compilers and `glibc` use, and enough Linux syscalls to get through libc start-up and read files are implemented. No threads, signals, writable files or networking, though. And it's bash, so expect it to be slow. Very slow.
 
 ### Will you support more instructions, CPUs, binary formats?
 
-Probably not; but who knows? I've seen weirder things on the internet.
+I said "probably not" last time, and then added ELF, dynamic linking and SSE2. So: probably not; but who knows? I've seen weirder things on the internet.
