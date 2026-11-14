@@ -187,21 +187,41 @@ declare -i GLOBAL_fs_base=0
 declare -i GLOBAL_gs_base=0
 
 # Insanity
-declare -a memory
+declare -ia memory=()
 
-declare -a registers
+declare -ia registers=()
+
+# 128-bit SSE/SSE2 registers XMM0-XMM15 (low and high 64-bit halves).
+declare -ia xmm_lo=()
+declare -ia xmm_hi=()
+
+# Time-stamp counter and MXCSR state.
+declare -i GLOBAL_tsc=0
+declare -i GLOBAL_mxcsr=$((0x1f80))
 
 # Instruction decoding state. Shadowed by run(), declared globally so that the
 # instruction helpers can be used directly (e.g. by the tests).
 declare -i rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
-declare -i rip=0 advance=0 val=0 cond=0
+declare -i addr_size_prefix=0 seg_override=0 seg_base=0 rep_prefix=0
+declare -i rip=0 advance=0 val=0 cond=0 displacement=0
+declare -i modrm=0 modrm_mod=0 modrm_reg=0 modrm_rm=0 modrm_address=0
+
+# Pre-declared integer scratch variables for hot execution helpers to avoid
+# per-instruction `declare -i` overhead in step().
+declare -i step_op=0 step_op2=0 step_width=0 step_imm_bytes=0
+declare -i step_a=0 step_b=0 step_c=0 step_d=0
+declare -i _da=0 _om_m=0 _om_imm=0 _om_disp=0 _om_sib=0 _om_base=0 _om_index=0 _om_a=0
+declare -i _rma=0 _wma=0 _wmv=0 _alu_r=0 _alu_mask=0 _alu_sbit=0 _alu_carry=0
+declare -i _ibo_op=0 _ibo_modrm=0 _ibo_w=0 _ibo_a=0 _ibo_b=0
+declare -i slo=0 shi=0 dlo=0 dhi=0 rlo=0 rhi=0
+declare -i _xi=0 _xda=0 _xsb=0 _xv=0 _xres=0 _xmask=0 _xlo=0 _xhi=0
 
 # RFLAGS, one variable per flag.
 declare -i flag_cf=0 flag_pf=0 flag_af=0 flag_zf=0 flag_sf=0 flag_of=0 flag_df=0
 declare -ri INT64_MIN=$((1 << 63))
 
 # parity_table[byte] is 1 when byte has an even number of bits set (PF).
-declare -a parity_table
+declare -ia parity_table=()
 function init_parity_table() {
 	declare -i i b p
 	for ((i = 0; i < 256; i++)); do
@@ -898,53 +918,63 @@ function ule() {
 
 # Sets `val` to `value` (of `width` bytes) sign-extended to 64 bits.
 function sign_extend() {
-	declare -ri width="$1" value="$2"
-	case $((width)) in
-	1) ((val = ((value & 0xff) ^ 0x80) - 0x80)) || : ;;
-	2) ((val = ((value & 0xffff) ^ 0x8000) - 0x8000)) || : ;;
-	4) ((val = ((value & 0xffffffff) ^ 0x80000000) - 0x80000000)) || : ;;
-	*) ((val = value)) || : ;;
+	case $1 in
+	4) ((val = (($2 & 0xffffffff) ^ 0x80000000) - 0x80000000)) || : ;;
+	1) ((val = (($2 & 0xff) ^ 0x80) - 0x80)) || : ;;
+	2) ((val = (($2 & 0xffff) ^ 0x8000) - 0x8000)) || : ;;
+	*) ((val = $2)) || : ;;
 	esac
 }
 
 # Modifies variables `displacement` and `advance`
 function disp64() {
-	declare -ri a=$((rip + advance))
-	((displacement = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 |
-		memory[a + 3] << 24 | memory[a + 4] << 32 | memory[a + 5] << 40 |
-		memory[a + 6] << 48 | memory[a + 7] << 56)) || :
-	((advance += 8)) || :
+	((_da = rip + advance,
+		displacement = memory[_da] | memory[_da + 1] << 8 | memory[_da + 2] << 16 |
+			memory[_da + 3] << 24 | memory[_da + 4] << 32 | memory[_da + 5] << 40 |
+			memory[_da + 6] << 48 | memory[_da + 7] << 56,
+		advance += 8)) || :
 }
 
 # Modifies variables `displacement` and `advance`. Sign-extended.
 function disp32() {
-	declare -ri a=$((rip + advance))
-	((displacement = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 | memory[a + 3] << 24)) || :
-	((displacement = (displacement ^ 0x80000000) - 0x80000000)) || :
-	((advance += 4)) || :
+	((_da = rip + advance,
+		displacement = ((memory[_da] | memory[_da + 1] << 8 | memory[_da + 2] << 16 | memory[_da + 3] << 24) ^ 0x80000000) - 0x80000000,
+		advance += 4)) || :
 }
 
 # Modifies variables `displacement` and `advance`. Sign-extended.
 function disp16() {
-	declare -ri a=$((rip + advance))
-	((displacement = ((memory[a] | memory[a + 1] << 8) ^ 0x8000) - 0x8000)) || :
-	((advance += 2)) || :
+	((_da = rip + advance,
+		displacement = ((memory[_da] | memory[_da + 1] << 8) ^ 0x8000) - 0x8000,
+		advance += 2)) || :
 }
 
 # Modifies variables `displacement` and `advance`. Sign-extended.
 function disp8() {
-	((displacement = (memory[rip + advance] ^ 0x80) - 0x80)) || :
-	((advance += 1)) || :
+	((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance += 1)) || :
 }
 
 # Modifies variables `displacement` and `advance`
 function disp_width() {
-	declare -i width="$1"
-	case $((width)) in
-	$((WIDTH8))) disp8 ;;
-	$((WIDTH16))) disp16 ;;
-	$((WIDTH32))) disp32 ;;
-	$((WIDTH64))) disp64 ;;
+	case $1 in
+	4)
+		((_da = rip + advance,
+			displacement = ((memory[_da] | memory[_da + 1] << 8 | memory[_da + 2] << 16 | memory[_da + 3] << 24) ^ 0x80000000) - 0x80000000,
+			advance += 4)) || :
+		;;
+	1) ((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance += 1)) || : ;;
+	8)
+		((_da = rip + advance,
+			displacement = memory[_da] | memory[_da + 1] << 8 | memory[_da + 2] << 16 |
+				memory[_da + 3] << 24 | memory[_da + 4] << 32 | memory[_da + 5] << 40 |
+				memory[_da + 6] << 48 | memory[_da + 7] << 56,
+			advance += 8)) || :
+		;;
+	2)
+		((_da = rip + advance,
+			displacement = ((memory[_da] | memory[_da + 1] << 8) ^ 0x8000) - 0x8000,
+			advance += 2)) || :
+		;;
 	*) die "Invalid width for immediate value or displacement." ;;
 	esac
 }
@@ -954,154 +984,210 @@ function disp_width() {
 # `imm_size` is the number of immediate bytes that follow the modrm operand:
 # RIP-relative addresses are relative to the end of the instruction.
 function operands_modrm() {
-	declare -i modrm="$1"
-	declare -i imm_size="${2:-0}"
-	declare -i displacement=0 sib base index
-	((modrm_mod = modrm >> 6 & 0x3)) || :
-	((modrm_reg = (modrm >> 3) & 0x7 | rex_r << 3)) || :
-	((modrm_rm = (modrm) & 0x7 | rex_b << 3)) || :
-	modrm_address=0
+	_om_m=$1
+	_om_imm=${2:-0}
+	((modrm_mod = (_om_m >> 6) & 3,
+		modrm_reg = ((_om_m >> 3) & 7) | (rex_r << 3),
+		modrm_rm = (_om_m & 7) | (rex_b << 3))) || :
 
 	if ((modrm_mod == 3)); then
+		modrm_address=0
 		return 0
 	fi
 
-	if (((modrm & 0x7) == 4)); then
+	if (((_om_m & 7) == 4)); then
 		# SIB byte
-		((sib = memory[rip + advance])) || :
-		((advance++)) || :
-		((index = (sib >> 3) & 0x7 | rex_x << 3)) || :
-		((base = sib & 0x7 | rex_b << 3)) || :
-		if (((sib & 0x7) == 5 && modrm_mod == 0)); then
+		((_om_sib = memory[rip + advance], advance++,
+			_om_index = ((_om_sib >> 3) & 7) | (rex_x << 3),
+			_om_base = (_om_sib & 7) | (rex_b << 3))) || :
+		if (((_om_sib & 7) == 5 && modrm_mod == 0)); then
 			# No base register, disp32 only.
-			disp32
-			((modrm_address = displacement)) || :
+			((_om_a = rip + advance,
+				modrm_address = ((memory[_om_a] | memory[_om_a + 1] << 8 | memory[_om_a + 2] << 16 | memory[_om_a + 3] << 24) ^ 0x80000000) - 0x80000000,
+				advance += 4)) || :
 		else
-			((modrm_address = registers[base])) || :
+			((modrm_address = registers[_om_base])) || :
 		fi
 		# index 4 (rsp) means no index. r12 (with REX.X) is a valid index.
-		if ((index != RSP)); then
-			((modrm_address += registers[index] << (sib >> 6 & 0x3))) || :
+		if ((_om_index != 4)); then
+			((modrm_address += registers[_om_index] << ((_om_sib >> 6) & 3))) || :
 		fi
-	elif (((modrm & 0x7) == 5 && modrm_mod == 0)); then
+	elif (((_om_m & 7) == 5 && modrm_mod == 0)); then
 		# RIP addressing, relative to the address of the next instruction.
-		disp32
-		((modrm_address = rip + advance + imm_size + displacement)) || :
-		return 0
+		((_om_a = rip + advance,
+			_om_disp = ((memory[_om_a] | memory[_om_a + 1] << 8 | memory[_om_a + 2] << 16 | memory[_om_a + 3] << 24) ^ 0x80000000) - 0x80000000,
+			advance += 4,
+			modrm_address = rip + advance + _om_imm + _om_disp)) || :
 	else
 		((modrm_address = registers[modrm_rm])) || :
 	fi
 
-	case $((modrm_mod)) in
+	case ${modrm_mod} in
 	1)
-		disp8
-		((modrm_address += displacement)) || :
+		((modrm_address += (memory[rip + advance] ^ 0x80) - 0x80, advance += 1)) || :
 		;;
 	2)
-		disp32
-		((modrm_address += displacement)) || :
+		((_om_a = rip + advance,
+			modrm_address += ((memory[_om_a] | memory[_om_a + 1] << 8 | memory[_om_a + 2] << 16 | memory[_om_a + 3] << 24) ^ 0x80000000) - 0x80000000,
+			advance += 4)) || :
 		;;
 	esac
+
+	if ((addr_size_prefix)); then
+		((modrm_address &= 0xffffffff)) || :
+	fi
+	if ((seg_base)); then
+		((modrm_address += seg_base)) || :
+	fi
 }
 
 # Sets `val` to the zero-extended value of register `reg` of `width` bytes.
 # Byte registers 4-7 are AH, CH, DH, BH unless a REX prefix is present.
 function read_reg() {
-	declare -ri width="$1" reg="$2"
-	case $((width)) in
+	case $1 in
+	8) ((val = registers[$2])) || : ;;
+	4) ((val = registers[$2] & 0xffffffff)) || : ;;
 	1)
-		if ((reg >= 4 && reg < 8 && !rex)); then
-			((val = (registers[reg - 4] >> 8) & 0xff)) || :
+		if (($2 >= 4 && $2 < 8 && !rex)); then
+			((val = (registers[$2 - 4] >> 8) & 0xff)) || :
 		else
-			((val = registers[reg] & 0xff)) || :
+			((val = registers[$2] & 0xff)) || :
 		fi
 		;;
-	2) ((val = registers[reg] & 0xffff)) || : ;;
-	4) ((val = registers[reg] & 0xffffffff)) || : ;;
-	8) ((val = registers[reg])) || : ;;
-	*) die "Unsupported data width in read_reg: ${width}" ;;
+	2) ((val = registers[$2] & 0xffff)) || : ;;
+	*) die "Unsupported data width in read_reg: $1" ;;
 	esac
 }
 
 # Writes register `reg`. 32-bit writes zero the upper half of the register,
 # 8 and 16-bit writes preserve the other bits.
 function write_reg() {
-	declare -ri width="$1" reg="$2" value="$3"
-	case $((width)) in
+	case $1 in
+	8) ((registers[$2] = $3)) || : ;;
+	4) ((registers[$2] = $3 & 0xffffffff)) || : ;;
 	1)
-		if ((reg >= 4 && reg < 8 && !rex)); then
-			((registers[reg - 4] = registers[reg - 4] & ~0xff00 | (value & 0xff) << 8)) || :
+		if (($2 >= 4 && $2 < 8 && !rex)); then
+			((registers[$2 - 4] = (registers[$2 - 4] & ~0xff00) | (($3 & 0xff) << 8))) || :
 		else
-			((registers[reg] = registers[reg] & ~0xff | (value & 0xff))) || :
+			((registers[$2] = (registers[$2] & ~0xff) | ($3 & 0xff))) || :
 		fi
 		;;
-	2) ((registers[reg] = registers[reg] & ~0xffff | (value & 0xffff))) || : ;;
-	4) ((registers[reg] = value & 0xffffffff)) || : ;;
-	8) ((registers[reg] = value)) || : ;;
-	*) die "Unsupported data width in write_reg: ${width}" ;;
+	2) ((registers[$2] = (registers[$2] & ~0xffff) | ($3 & 0xffff))) || : ;;
+	*) die "Unsupported data width in write_reg: $1" ;;
 	esac
 }
 
 # Sets `val` to the little endian value of `width` bytes at `address`.
 function read_mem() {
-	declare -ri width="$1" a="$2"
-	case $((width)) in
-	1) ((val = memory[a])) || : ;;
-	2) ((val = memory[a] | memory[a + 1] << 8)) || : ;;
-	4) ((val = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 | memory[a + 3] << 24)) || : ;;
+	_rma=$2
+	case $1 in
 	8)
-		((val = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 |
-			memory[a + 3] << 24 | memory[a + 4] << 32 | memory[a + 5] << 40 |
-			memory[a + 6] << 48 | memory[a + 7] << 56)) || :
+		((val = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 |
+			memory[_rma + 3] << 24 | memory[_rma + 4] << 32 | memory[_rma + 5] << 40 |
+			memory[_rma + 6] << 48 | memory[_rma + 7] << 56)) || :
 		;;
-	*) die "Unsupported data width in read_mem: ${width}" ;;
+	4) ((val = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 | memory[_rma + 3] << 24)) || : ;;
+	1) ((val = memory[_rma])) || : ;;
+	2) ((val = memory[_rma] | memory[_rma + 1] << 8)) || : ;;
+	*) die "Unsupported data width in read_mem: $1" ;;
 	esac
 }
 
 function write_mem() {
-	declare -ri width="$1" a="$2" value="$3"
-	declare -i i
-	for ((i = 0; i < width; i++)); do
-		((memory[a + i] = (value >> (8 * i)) & 0xff)) || :
-	done
+	_wma=$2
+	_wmv=$3
+	case $1 in
+	8)
+		((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff,
+			memory[_wma + 2] = (_wmv >> 16) & 0xff, memory[_wma + 3] = (_wmv >> 24) & 0xff,
+			memory[_wma + 4] = (_wmv >> 32) & 0xff, memory[_wma + 5] = (_wmv >> 40) & 0xff,
+			memory[_wma + 6] = (_wmv >> 48) & 0xff, memory[_wma + 7] = (_wmv >> 56) & 0xff)) || :
+		;;
+	4)
+		((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff,
+			memory[_wma + 2] = (_wmv >> 16) & 0xff, memory[_wma + 3] = (_wmv >> 24) & 0xff)) || :
+		;;
+	1) ((memory[_wma] = _wmv & 0xff)) || : ;;
+	2) ((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff)) || : ;;
+	*) die "Unsupported data width in write_mem: $1" ;;
+	esac
 }
 
 # Read/write the r/m operand decoded by operands_modrm.
 function read_rm() {
 	if ((modrm_mod == 3)); then
-		read_reg "$1" $((modrm_rm))
+		case $1 in
+		8) ((val = registers[modrm_rm])) || : ;;
+		4) ((val = registers[modrm_rm] & 0xffffffff)) || : ;;
+		*) read_reg "$1" "${modrm_rm}" ;;
+		esac
 	else
-		read_mem "$1" $((modrm_address))
+		_rma=${modrm_address}
+		case $1 in
+		8)
+			((val = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 |
+				memory[_rma + 3] << 24 | memory[_rma + 4] << 32 | memory[_rma + 5] << 40 |
+				memory[_rma + 6] << 48 | memory[_rma + 7] << 56)) || :
+			;;
+		4) ((val = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 | memory[_rma + 3] << 24)) || : ;;
+		1) ((val = memory[_rma])) || : ;;
+		2) ((val = memory[_rma] | memory[_rma + 1] << 8)) || : ;;
+		*) die "Unsupported data width in read_rm: $1" ;;
+		esac
 	fi
 }
 
 function write_rm() {
 	if ((modrm_mod == 3)); then
-		write_reg "$1" $((modrm_rm)) "$2"
+		case $1 in
+		8) ((registers[modrm_rm] = $2)) || : ;;
+		4) ((registers[modrm_rm] = $2 & 0xffffffff)) || : ;;
+		*) write_reg "$1" "${modrm_rm}" "$2" ;;
+		esac
 	else
-		write_mem "$1" $((modrm_address)) "$2"
+		_wma=${modrm_address}
+		_wmv=$2
+		case $1 in
+		8)
+			((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff,
+				memory[_wma + 2] = (_wmv >> 16) & 0xff, memory[_wma + 3] = (_wmv >> 24) & 0xff,
+				memory[_wma + 4] = (_wmv >> 32) & 0xff, memory[_wma + 5] = (_wmv >> 40) & 0xff,
+				memory[_wma + 6] = (_wmv >> 48) & 0xff, memory[_wma + 7] = (_wmv >> 56) & 0xff)) || :
+			;;
+		4)
+			((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff,
+				memory[_wma + 2] = (_wmv >> 16) & 0xff, memory[_wma + 3] = (_wmv >> 24) & 0xff)) || :
+			;;
+		1) ((memory[_wma] = _wmv & 0xff)) || : ;;
+		2) ((memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff)) || : ;;
+		*) die "Unsupported data width in write_rm: $1" ;;
+		esac
 	fi
 }
 
 function push64() {
-	((registers[RSP] -= 8)) || :
-	write_mem 8 $((registers[RSP])) "$1"
+	((_wma = registers[RSP] - 8, registers[RSP] = _wma, _wmv = $1,
+		memory[_wma] = _wmv & 0xff, memory[_wma + 1] = (_wmv >> 8) & 0xff,
+		memory[_wma + 2] = (_wmv >> 16) & 0xff, memory[_wma + 3] = (_wmv >> 24) & 0xff,
+		memory[_wma + 4] = (_wmv >> 32) & 0xff, memory[_wma + 5] = (_wmv >> 40) & 0xff,
+		memory[_wma + 6] = (_wmv >> 48) & 0xff, memory[_wma + 7] = (_wmv >> 56) & 0xff)) || :
 }
 
 # Sets `val`
 function pop64() {
-	read_mem 8 $((registers[RSP]))
-	((registers[RSP] += 8)) || :
+	((_rma = registers[RSP], registers[RSP] = _rma + 8,
+		val = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 |
+			memory[_rma + 3] << 24 | memory[_rma + 4] << 32 | memory[_rma + 5] << 40 |
+			memory[_rma + 6] << 48 | memory[_rma + 7] << 56)) || :
 }
 
 ### Flags ###
 
 # Sets ZF, SF and PF from `result` of `width` bytes.
 function set_result_flags() {
-	declare -ri width="$1" result="$2"
-	((flag_zf = result == 0)) || :
-	((flag_sf = result >> (width * 8 - 1) & 1)) || :
-	((flag_pf = parity_table[result & 0xff])) || :
+	((flag_zf = $2 == 0,
+		flag_sf = ($2 >> ($1 * 8 - 1)) & 1,
+		flag_pf = parity_table[$2 & 0xff])) || :
 }
 
 # Returns RFLAGS as an integer.
@@ -1113,56 +1199,55 @@ function get_rflags() {
 # Sets `cond` to 1 when condition code `cc` (low nibble of jcc/setcc/cmovcc
 # opcodes) holds, 0 otherwise.
 function eval_cond() {
-	declare -ri cc="$1"
-	case $(((cc >> 1) & 7)) in
-	0) ((cond = flag_of)) || : ;;                        # o
-	1) ((cond = flag_cf)) || : ;;                        # b/c/nae
-	2) ((cond = flag_zf)) || : ;;                        # e/z
-	3) ((cond = flag_cf | flag_zf)) || : ;;              # be/na
-	4) ((cond = flag_sf)) || : ;;                        # s
-	5) ((cond = flag_pf)) || : ;;                        # p/pe
-	6) ((cond = flag_sf != flag_of)) || : ;;             # l/nge
-	7) ((cond = flag_zf | (flag_sf != flag_of))) || : ;; # le/ng
+	case $((($1 >> 1) & 7)) in
+	0) ((cond = flag_of ^ ($1 & 1))) || : ;;                        # o / no
+	1) ((cond = flag_cf ^ ($1 & 1))) || : ;;                        # b / ae
+	2) ((cond = flag_zf ^ ($1 & 1))) || : ;;                        # e / ne
+	3) ((cond = (flag_cf | flag_zf) ^ ($1 & 1))) || : ;;            # be / a
+	4) ((cond = flag_sf ^ ($1 & 1))) || : ;;                        # s / ns
+	5) ((cond = flag_pf ^ ($1 & 1))) || : ;;                        # p / np
+	6) ((cond = (flag_sf != flag_of) ^ ($1 & 1))) || : ;;           # l / ge
+	7) ((cond = (flag_zf | (flag_sf != flag_of)) ^ ($1 & 1))) || : ;; # le / g
 	esac
-	((cond ^= cc & 1)) || :
 }
 
 # Arithmetic/logic operation number `op` as encoded in opcodes 00-3F and
 # group 1 (0=add 1=or 2=adc 3=sbb 4=and 5=sub 6=xor 7=cmp) on zero-extended
 # operands `a` and `b` of `width` bytes. Sets `val` and the flags.
 function alu() {
-	declare -ri op="$1" width="$2" a="$3" b="$4"
-	declare -i r mask sbit carry=0
-	((mask = width == 8 ? -1 : (1 << (width * 8)) - 1)) || :
-	((sbit = width * 8 - 1)) || :
-	case $((op)) in
-	0 | 2)
-		if ((op == 2)); then ((carry = flag_cf)) || :; fi
-		((r = (a + b + carry) & mask)) || :
-		if ((carry)); then
-			((flag_cf = (r ^ INT64_MIN) <= (a ^ INT64_MIN))) || :
-		else
-			((flag_cf = (r ^ INT64_MIN) < (a ^ INT64_MIN))) || :
-		fi
-		((flag_of = ((a ^ r) & (b ^ r)) >> sbit & 1)) || :
+	((_alu_mask = $2 == 8 ? -1 : (1 << ($2 * 8)) - 1, _alu_sbit = $2 * 8 - 1)) || :
+	case $1 in
+	0)
+		((_alu_r = ($3 + $4) & _alu_mask,
+			flag_cf = (_alu_r ^ INT64_MIN) < ($3 ^ INT64_MIN),
+			flag_of = ((($3 ^ _alu_r) & ($4 ^ _alu_r)) >> _alu_sbit) & 1)) || :
 		;;
-	3 | 5 | 7)
-		if ((op == 3)); then ((carry = flag_cf)) || :; fi
-		((r = (a - b - carry) & mask)) || :
-		if ((carry)); then
-			((flag_cf = (a ^ INT64_MIN) <= (b ^ INT64_MIN))) || :
-		else
-			((flag_cf = (a ^ INT64_MIN) < (b ^ INT64_MIN))) || :
-		fi
-		((flag_of = ((a ^ b) & (a ^ r)) >> sbit & 1)) || :
+	5 | 7)
+		((_alu_r = ($3 - $4) & _alu_mask,
+			flag_cf = ($3 ^ INT64_MIN) < ($4 ^ INT64_MIN),
+			flag_of = ((($3 ^ $4) & ($3 ^ _alu_r)) >> _alu_sbit) & 1)) || :
 		;;
-	1) ((r = a | b, flag_cf = 0, flag_of = 0)) || : ;;
-	4) ((r = a & b, flag_cf = 0, flag_of = 0)) || : ;;
-	6) ((r = (a ^ b) & mask, flag_cf = 0, flag_of = 0)) || : ;;
+	4) ((_alu_r = $3 & $4, flag_cf = 0, flag_of = 0)) || : ;;
+	6) ((_alu_r = ($3 ^ $4) & _alu_mask, flag_cf = 0, flag_of = 0)) || : ;;
+	1) ((_alu_r = ($3 | $4) & _alu_mask, flag_cf = 0, flag_of = 0)) || : ;;
+	2)
+		((_alu_carry = flag_cf,
+			_alu_r = ($3 + $4 + _alu_carry) & _alu_mask,
+			flag_cf = _alu_carry ? ((_alu_r ^ INT64_MIN) <= ($3 ^ INT64_MIN)) : ((_alu_r ^ INT64_MIN) < ($3 ^ INT64_MIN)),
+			flag_of = ((($3 ^ _alu_r) & ($4 ^ _alu_r)) >> _alu_sbit) & 1)) || :
+		;;
+	3)
+		((_alu_carry = flag_cf,
+			_alu_r = ($3 - $4 - _alu_carry) & _alu_mask,
+			flag_cf = _alu_carry ? (($3 ^ INT64_MIN) <= ($4 ^ INT64_MIN)) : (($3 ^ INT64_MIN) < ($4 ^ INT64_MIN)),
+			flag_of = ((($3 ^ $4) & ($3 ^ _alu_r)) >> _alu_sbit) & 1)) || :
+		;;
 	esac
-	((flag_af = ((a ^ b ^ r) >> 4) & 1)) || :
-	set_result_flags $((width)) $((r))
-	((val = r)) || :
+	((flag_af = (($3 ^ $4 ^ _alu_r) >> 4) & 1,
+		flag_zf = _alu_r == 0,
+		flag_sf = (_alu_r >> _alu_sbit) & 1,
+		flag_pf = parity_table[_alu_r & 0xff],
+		val = _alu_r)) || :
 }
 
 # Shift/rotate operation number `op` as encoded in group 2 (0=rol 1=ror
@@ -1472,464 +1557,1597 @@ function inst_muldiv() {
 # Instructions with a modrm operand and a register operand (00-3B families,
 # 84/85 test). The operation is encoded in the opcode.
 function inst_binary_op() {
-	declare -ri binary_instruction="$1"
-	declare -ri modrm="$2"
-	declare -ri direction=$(((binary_instruction >> 1) & 0x1))
-	declare -ri width_is_byte=$((~binary_instruction & 0x1))
-	declare -i op=$(((binary_instruction >> 3) & 0x7))
-	declare -i width a b
-	((width = width_is_byte ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
-
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-
-	read_rm $((width))
-	((a = val)) || :
-	read_reg $((width)) $((modrm_reg))
-	((b = val)) || :
-	if (((binary_instruction & 0xfe) == 0x84)); then
-		alu 4 $((width)) $((a)) $((b)) # test
+	((_ibo_op = ($1 >> 3) & 7,
+		_ibo_w = ($1 & 1) == 0 ? 1 : rex_w ? 8 : operand_size_prefix ? 2 : 4)) || :
+	operands_modrm "$2"
+	read_rm "${_ibo_w}"
+	_ibo_a=${val}
+	read_reg "${_ibo_w}" "${modrm_reg}"
+	_ibo_b=${val}
+	if ((($1 & 0xfe) == 0x84)); then
+		alu 4 "${_ibo_w}" "${_ibo_a}" "${_ibo_b}" # test
 		return 0
 	fi
-	if ((direction)); then
-		alu $((op)) $((width)) $((b)) $((a))
-		((op == 7)) || write_reg $((width)) $((modrm_reg)) $((val))
+	if ((($1 >> 1) & 1)); then
+		alu "${_ibo_op}" "${_ibo_w}" "${_ibo_b}" "${_ibo_a}"
+		if ((_ibo_op != 7)); then
+			write_reg "${_ibo_w}" "${modrm_reg}" "${val}"
+		fi
 	else
-		alu $((op)) $((width)) $((a)) $((b))
-		((op == 7)) || write_rm $((width)) $((val))
+		alu "${_ibo_op}" "${_ibo_w}" "${_ibo_a}" "${_ibo_b}"
+		if ((_ibo_op != 7)); then
+			write_rm "${_ibo_w}" "${val}"
+		fi
 	fi
-	return 0
 }
 
 # 88-8B
 function inst_mov() {
-	declare -ri mov="$1"
-	declare -ri modrm="$2"
-	declare -ri direction=$(((mov >> 1) & 0x1))
-	declare -ri width_is_byte=$((~mov & 0x1))
-	declare -i width
-	((width = width_is_byte ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
-
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-
-	if ((direction)); then
-		read_rm $((width))
-		write_reg $((width)) $((modrm_reg)) $((val))
+	((_ibo_w = ($1 & 1) == 0 ? 1 : rex_w ? 8 : operand_size_prefix ? 2 : 4)) || :
+	operands_modrm "$2"
+	if ((($1 >> 1) & 1)); then
+		read_rm "${_ibo_w}"
+		write_reg "${_ibo_w}" "${modrm_reg}" "${val}"
 	else
-		read_reg $((width)) $((modrm_reg))
-		write_rm $((width)) $((val))
+		read_reg "${_ibo_w}" "${modrm_reg}"
+		write_rm "${_ibo_w}" "${val}"
 	fi
 }
 
 function inst_lea() {
-	declare -i lea="$1"
-	declare -i modrm="$2"
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-	write_reg $((rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) $((modrm_reg)) $((modrm_address))
+	seg_base=0
+	operands_modrm "$2"
+	write_reg "$((rex_w ? 8 : operand_size_prefix ? 2 : 4))" "${modrm_reg}" "${modrm_address}"
 }
 
 # B0-BF. B8-BF with REX.W is movabs with a 64-bit immediate.
 function inst_mov_imm() {
-	declare -ri mov="$1"
-	declare -ri reg=$((mov & 0x7 | rex_b << 3))
-	declare -i width displacement
-	((width = mov < 0xb8 ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
-	disp_width $((width))
-	write_reg $((width)) $((reg)) $((displacement))
+	((_ibo_w = $1 < 184 ? 1 : rex_w ? 8 : operand_size_prefix ? 2 : 4)) || :
+	disp_width "${_ibo_w}"
+	write_reg "${_ibo_w}" "$(($1 & 7 | rex_b << 3))" "${displacement}"
 }
 
 function inst_push() {
-	declare -i reg="$1"
-	push64 $((registers[reg]))
+	push64 "${registers[$1]}"
+}
+
+# Bit test helper: $1=op (0=bt,1=bts,2=btr,3=btc), $2=width, $3=bit, $4=is_mem, $5=addr.
+function exec_bit_op() {
+	if (($4 == 0)); then
+		read_reg "$2" "${modrm_rm}"
+		((flag_cf = (val >> $3) & 1)) || :
+		case $1 in
+		1) write_reg "$2" "${modrm_rm}" "$((val | (1 << $3)))" ;;
+		2) write_reg "$2" "${modrm_rm}" "$((val & ~(1 << $3)))" ;;
+		3) write_reg "$2" "${modrm_rm}" "$((val ^ (1 << $3)))" ;;
+		esac
+	else
+		read_mem "$2" "$5"
+		((flag_cf = (val >> $3) & 1)) || :
+		case $1 in
+		1) write_mem "$2" "$5" "$((val | (1 << $3)))" ;;
+		2) write_mem "$2" "$5" "$((val & ~(1 << $3)))" ;;
+		3) write_mem "$2" "$5" "$((val ^ (1 << $3)))" ;;
+		esac
+	fi
+}
+
+### SSE / SSE2 helpers ###
+
+function read_xmm_rm() {
+	if ((modrm_mod == 3)); then
+		((slo = xmm_lo[modrm_rm], shi = xmm_hi[modrm_rm])) || :
+	else
+		((_rma = modrm_address,
+			slo = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 |
+				memory[_rma + 3] << 24 | memory[_rma + 4] << 32 | memory[_rma + 5] << 40 |
+				memory[_rma + 6] << 48 | memory[_rma + 7] << 56,
+			_rma += 8,
+			shi = memory[_rma] | memory[_rma + 1] << 8 | memory[_rma + 2] << 16 |
+				memory[_rma + 3] << 24 | memory[_rma + 4] << 32 | memory[_rma + 5] << 40 |
+				memory[_rma + 6] << 48 | memory[_rma + 7] << 56)) || :
+	fi
+}
+
+function write_xmm_rm() {
+	if ((modrm_mod == 3)); then
+		((xmm_lo[modrm_rm] = $1, xmm_hi[modrm_rm] = $2)) || :
+	else
+		write_mem 8 "${modrm_address}" "$1"
+		write_mem 8 "$((modrm_address + 8))" "$2"
+	fi
+}
+
+function sse_unpack_bw() {
+	((rlo = ($1 & 0xff) | (($2 & 0xff) << 8) |
+		((($1 >> 8) & 0xff) << 16) | ((($2 >> 8) & 0xff) << 24) |
+		((($1 >> 16) & 0xff) << 32) | ((($2 >> 16) & 0xff) << 40) |
+		((($1 >> 24) & 0xff) << 48) | ((($2 >> 24) & 0xff) << 56),
+		rhi = (($1 >> 32) & 0xff) | ((($2 >> 32) & 0xff) << 8) |
+			((($1 >> 40) & 0xff) << 16) | ((($2 >> 40) & 0xff) << 24) |
+			((($1 >> 48) & 0xff) << 32) | ((($2 >> 48) & 0xff) << 40) |
+			((($1 >> 56) & 0xff) << 48) | ((($2 >> 56) & 0xff) << 56))) || :
+}
+
+function sse_unpack_wd() {
+	((rlo = ($1 & 0xffff) | (($2 & 0xffff) << 16) |
+		((($1 >> 16) & 0xffff) << 32) | ((($2 >> 16) & 0xffff) << 48),
+		rhi = (($1 >> 32) & 0xffff) | ((($2 >> 32) & 0xffff) << 16) |
+			((($1 >> 48) & 0xffff) << 32) | ((($2 >> 48) & 0xffff) << 48))) || :
+}
+
+# Byte-wise op ($1: 0=pminub 1=pmaxub 2=pcmpgtb 3=psubusb 4=paddusb) on 8 bytes of $2 and $3 -> _xres.
+function sse_byte_half() {
+	_xres=0
+	for ((_xi = 0; _xi < 64; _xi += 8)); do
+		((_xda = ($2 >> _xi) & 0xff, _xsb = ($3 >> _xi) & 0xff)) || :
+		case $1 in
+		0) ((_xv = _xda < _xsb ? _xda : _xsb)) || : ;;
+		1) ((_xv = _xda > _xsb ? _xda : _xsb)) || : ;;
+		2) ((_xv = ((_xda ^ 0x80) - 0x80) > ((_xsb ^ 0x80) - 0x80) ? 0xff : 0)) || : ;;
+		3) ((_xv = _xda > _xsb ? _xda - _xsb : 0)) || : ;;
+		4) ((_xv = _xda + _xsb > 255 ? 255 : _xda + _xsb)) || : ;;
+		esac
+		((_xres |= _xv << _xi)) || :
+	done
+}
+
+# Word-wise compare ($1: 0=pcmpeqw 1=pcmpgtw) on 4 words of $2 and $3 -> _xres.
+function sse_word_half() {
+	_xres=0
+	for ((_xi = 0; _xi < 64; _xi += 16)); do
+		((_xda = ($2 >> _xi) & 0xffff, _xsb = ($3 >> _xi) & 0xffff)) || :
+		if (($1 == 0)); then
+			((_xv = _xda == _xsb ? 0xffff : 0)) || :
+		else
+			((_xv = ((_xda ^ 0x8000) - 0x8000) > ((_xsb ^ 0x8000) - 0x8000) ? 0xffff : 0)) || :
+		fi
+		((_xres |= _xv << _xi)) || :
+	done
+}
+
+# Shifts XMM[$1] by signed/unsigned count $3 with mode $2:
+# 0=psrlw 1=psraw 2=psllw 3=psrld 4=psrad 5=pslld 6=psrlq 7=psllq
+function sse_shift_xmm() {
+	((_xlo = xmm_lo[$1], _xhi = xmm_hi[$1], _xv = $3)) || :
+	case $2 in
+	0) # psrlw
+		if ((_xv < 0 || _xv >= 16)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xmask = (0xffff >> _xv) * 0x0001000100010001,
+				_xlo = (_xlo >> _xv) & _xmask, _xhi = (_xhi >> _xv) & _xmask)) || :
+		fi
+		;;
+	1) # psraw
+		if ((_xv < 0 || _xv > 15)); then _xv=15; fi
+		if ((_xv > 0)); then
+			rlo=0 rhi=0
+			for ((_xi = 0; _xi < 64; _xi += 16)); do
+				((_xda = ((((_xlo >> _xi) & 0xffff) ^ 0x8000) - 0x8000) >> _xv,
+					_xsb = ((((_xhi >> _xi) & 0xffff) ^ 0x8000) - 0x8000) >> _xv,
+					rlo |= (_xda & 0xffff) << _xi,
+					rhi |= (_xsb & 0xffff) << _xi)) || :
+			done
+			_xlo=${rlo} _xhi=${rhi}
+		fi
+		;;
+	2) # psllw
+		if ((_xv < 0 || _xv >= 16)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xmask = (0xffff >> _xv) * 0x0001000100010001,
+				_xlo = (_xlo & _xmask) << _xv, _xhi = (_xhi & _xmask) << _xv)) || :
+		fi
+		;;
+	3) # psrld
+		if ((_xv < 0 || _xv >= 32)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xmask = (0xffffffff >> _xv) | ((0xffffffff >> _xv) << 32),
+				_xlo = (_xlo >> _xv) & _xmask, _xhi = (_xhi >> _xv) & _xmask)) || :
+		fi
+		;;
+	4) # psrad
+		if ((_xv < 0 || _xv > 31)); then _xv=31; fi
+		if ((_xv > 0)); then
+			((rlo = (((((_xlo & 0xffffffff) ^ 0x80000000) - 0x80000000) >> _xv) & 0xffffffff) |
+				(((((((_xlo >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) >> _xv) & 0xffffffff) << 32),
+				rhi = (((((_xhi & 0xffffffff) ^ 0x80000000) - 0x80000000) >> _xv) & 0xffffffff) |
+					(((((((_xhi >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) >> _xv) & 0xffffffff) << 32),
+				_xlo = rlo, _xhi = rhi)) || :
+		fi
+		;;
+	5) # pslld
+		if ((_xv < 0 || _xv >= 32)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xmask = (0xffffffff >> _xv) | ((0xffffffff >> _xv) << 32),
+				_xlo = (_xlo & _xmask) << _xv, _xhi = (_xhi & _xmask) << _xv)) || :
+		fi
+		;;
+	6) # psrlq
+		if ((_xv < 0 || _xv >= 64)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xmask = (1 << (64 - _xv)) - 1,
+				_xlo = (_xlo >> _xv) & _xmask, _xhi = (_xhi >> _xv) & _xmask)) || :
+		fi
+		;;
+	7) # psllq
+		if ((_xv < 0 || _xv >= 64)); then
+			_xlo=0 _xhi=0
+		elif ((_xv > 0)); then
+			((_xlo <<= _xv, _xhi <<= _xv)) || :
+		fi
+		;;
+	esac
+	((xmm_lo[$1] = _xlo, xmm_hi[$1] = _xhi)) || :
+}
+
+# Executes 2-byte `0f <step_op2>` instructions.
+function step_0f() {
+	((step_op2 = memory[rip + advance], advance++)) || :
+	case $((step_op2 & 0xf0)) in
+	64) # 0x40-0x4f: cmovcc
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		eval_cond "${step_op2}"
+		if ((cond)); then
+			write_reg "${step_width}" "${modrm_reg}" "${val}"
+		elif ((step_width == 4)); then
+			# Upper bits are cleared even if the condition is false.
+			((registers[modrm_reg] &= 0xffffffff)) || :
+		fi
+		return 0
+		;;
+	128) # 0x80-0x8f: jcc rel32
+		disp32
+		eval_cond "${step_op2}"
+		if ((cond)); then ((advance += displacement)) || :; fi
+		return 0
+		;;
+	144) # 0x90-0x9f: setcc
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		eval_cond "${step_op2}"
+		write_rm 1 "${cond}"
+		return 0
+		;;
+	esac
+
+	case ${step_op2} in
+	5) # 0x05: syscall
+		inst_syscall
+		;;
+	1) # 0x01: xgetbv / rdtscp
+		((modrm = memory[rip + advance], advance++)) || :
+		case ${modrm} in
+		208) # 0xd0: xgetbv (x87 + XMM enabled, YMM/AVX disabled)
+			write_reg 4 0 3
+			write_reg 4 2 0
+			;;
+		249) # 0xf9: rdtscp
+			((GLOBAL_tsc += 100)) || :
+			write_reg 4 0 "$((GLOBAL_tsc & 0xffffffff))"
+			write_reg 4 2 "$(((GLOBAL_tsc >> 32) & 0xffffffff))"
+			write_reg 4 1 0
+			;;
+		*)
+			unknown_insruction "$(printf '0f 01 %02x' $((modrm)))" "unsupported 0f 01 instruction"
+			;;
+		esac
+		;;
+	11) # 0x0b: ud2
+		die "Undefined instruction (ud2) at 0x%x" $((rip))
+		;;
+	16) # 0x10: movups / 66 movupd / f3 movss / f2 movsd (load)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rep_prefix == 243)); then
+			if ((modrm_mod == 3)); then
+				((xmm_lo[modrm_reg] = (xmm_lo[modrm_reg] & ~0xffffffff) | (xmm_lo[modrm_rm] & 0xffffffff))) || :
+			else
+				read_mem 4 "${modrm_address}"
+				((xmm_lo[modrm_reg] = val & 0xffffffff, xmm_hi[modrm_reg] = 0)) || :
+			fi
+		elif ((rep_prefix == 242)); then
+			if ((modrm_mod == 3)); then
+				((xmm_lo[modrm_reg] = xmm_lo[modrm_rm])) || :
+			else
+				read_mem 8 "${modrm_address}"
+				((xmm_lo[modrm_reg] = val, xmm_hi[modrm_reg] = 0)) || :
+			fi
+		else
+			read_xmm_rm
+			((xmm_lo[modrm_reg] = slo, xmm_hi[modrm_reg] = shi)) || :
+		fi
+		;;
+	17) # 0x11: movups / 66 movupd / f3 movss / f2 movsd (store)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rep_prefix == 243)); then
+			if ((modrm_mod == 3)); then
+				((xmm_lo[modrm_rm] = (xmm_lo[modrm_rm] & ~0xffffffff) | (xmm_lo[modrm_reg] & 0xffffffff))) || :
+			else
+				write_mem 4 "${modrm_address}" "$((xmm_lo[modrm_reg] & 0xffffffff))"
+			fi
+		elif ((rep_prefix == 242)); then
+			if ((modrm_mod == 3)); then
+				((xmm_lo[modrm_rm] = xmm_lo[modrm_reg])) || :
+			else
+				write_mem 8 "${modrm_address}" "${xmm_lo[modrm_reg]}"
+			fi
+		else
+			write_xmm_rm "${xmm_lo[modrm_reg]}" "${xmm_hi[modrm_reg]}"
+		fi
+		;;
+	18) # 0x12: f2 movddup / f3 movsldup / movhlps / movlps / 66 movlpd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rep_prefix == 242)); then
+			if ((modrm_mod == 3)); then
+				((slo = xmm_lo[modrm_rm])) || :
+			else
+				read_mem 8 "${modrm_address}"
+				slo=${val}
+			fi
+			((xmm_lo[modrm_reg] = slo, xmm_hi[modrm_reg] = slo)) || :
+		elif ((rep_prefix == 243)); then
+			read_xmm_rm
+			((xmm_lo[modrm_reg] = (slo & 0xffffffff) | ((slo & 0xffffffff) << 32),
+				xmm_hi[modrm_reg] = (shi & 0xffffffff) | ((shi & 0xffffffff) << 32))) || :
+		elif ((modrm_mod == 3)); then
+			((xmm_lo[modrm_reg] = xmm_hi[modrm_rm])) || :
+		else
+			read_mem 8 "${modrm_address}"
+			((xmm_lo[modrm_reg] = val)) || :
+		fi
+		;;
+	19) # 0x13: movlps / 66 movlpd (store)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		write_mem 8 "${modrm_address}" "${xmm_lo[modrm_reg]}"
+		;;
+	20) # 0x14: unpcklps / 66 unpcklpd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		if ((operand_size_prefix)); then
+			((xmm_hi[modrm_reg] = slo)) || :
+		else
+			((dlo = xmm_lo[modrm_reg],
+				xmm_lo[modrm_reg] = (dlo & 0xffffffff) | ((slo & 0xffffffff) << 32),
+				xmm_hi[modrm_reg] = ((dlo >> 32) & 0xffffffff) | (((slo >> 32) & 0xffffffff) << 32))) || :
+		fi
+		;;
+	21) # 0x15: unpckhps / 66 unpckhpd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		if ((operand_size_prefix)); then
+			((xmm_lo[modrm_reg] = xmm_hi[modrm_reg], xmm_hi[modrm_reg] = shi)) || :
+		else
+			((dhi = xmm_hi[modrm_reg],
+				xmm_lo[modrm_reg] = (dhi & 0xffffffff) | ((shi & 0xffffffff) << 32),
+				xmm_hi[modrm_reg] = ((dhi >> 32) & 0xffffffff) | (((shi >> 32) & 0xffffffff) << 32))) || :
+		fi
+		;;
+	22) # 0x16: f3 movshdup / movlhps / movhps / 66 movhpd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rep_prefix == 243)); then
+			read_xmm_rm
+			((slo = (slo >> 32) & 0xffffffff, shi = (shi >> 32) & 0xffffffff,
+				xmm_lo[modrm_reg] = slo | (slo << 32), xmm_hi[modrm_reg] = shi | (shi << 32))) || :
+		elif ((modrm_mod == 3)); then
+			((xmm_hi[modrm_reg] = xmm_lo[modrm_rm])) || :
+		else
+			read_mem 8 "${modrm_address}"
+			((xmm_hi[modrm_reg] = val)) || :
+		fi
+		;;
+	23) # 0x17: movhps / 66 movhpd (store)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		write_mem 8 "${modrm_address}" "${xmm_hi[modrm_reg]}"
+		;;
+	24 | 25 | 26 | 27 | 28 | 29 | 30 | 31) # 0x18-0x1f: hint nops, prefetch, endbr64
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		;;
+	40 | 111 | 240) # 0x28 movaps/pd, 0x6f movdqa/dqu, 0xf0 lddqu (load)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] = slo, xmm_hi[modrm_reg] = shi)) || :
+		;;
+	41 | 43 | 127 | 231) # 0x29 movaps/pd, 0x2b movntps/pd, 0x7f movdqa/dqu, 0xe7 movntdq (store)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		write_xmm_rm "${xmm_lo[modrm_reg]}" "${xmm_hi[modrm_reg]}"
+		;;
+	49) # 0x31: rdtsc
+		((GLOBAL_tsc += 100)) || :
+		write_reg 4 0 "$((GLOBAL_tsc & 0xffffffff))"
+		write_reg 4 2 "$(((GLOBAL_tsc >> 32) & 0xffffffff))"
+		;;
+	80) # 0x50: movmskps / 66 movmskpd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		((slo = xmm_lo[modrm_rm], shi = xmm_hi[modrm_rm])) || :
+		if ((operand_size_prefix)); then
+			write_reg 4 "${modrm_reg}" "$((((slo >> 63) & 1) | (((shi >> 63) & 1) << 1)))"
+		else
+			write_reg 4 "${modrm_reg}" "$((((slo >> 31) & 1) | (((slo >> 63) & 1) << 1) | (((shi >> 31) & 1) << 2) | (((shi >> 63) & 1) << 3)))"
+		fi
+		;;
+	84 | 219) # 0x54 andps/pd, 0xdb pand
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] &= slo, xmm_hi[modrm_reg] &= shi)) || :
+		;;
+	85 | 223) # 0x55 andnps/pd, 0xdf pandn
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] = ~xmm_lo[modrm_reg] & slo, xmm_hi[modrm_reg] = ~xmm_hi[modrm_reg] & shi)) || :
+		;;
+	86 | 235) # 0x56 orps/pd, 0xeb por
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] |= slo, xmm_hi[modrm_reg] |= shi)) || :
+		;;
+	87 | 239) # 0x57 xorps/pd, 0xef pxor
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] ^= slo, xmm_hi[modrm_reg] ^= shi)) || :
+		;;
+	96) # 0x60: punpcklbw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_unpack_bw "${xmm_lo[modrm_reg]}" "${slo}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		;;
+	97) # 0x61: punpcklwd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_unpack_wd "${xmm_lo[modrm_reg]}" "${slo}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		;;
+	98) # 0x62: punpckldq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((dlo = xmm_lo[modrm_reg],
+			xmm_lo[modrm_reg] = (dlo & 0xffffffff) | ((slo & 0xffffffff) << 32),
+			xmm_hi[modrm_reg] = ((dlo >> 32) & 0xffffffff) | (((slo >> 32) & 0xffffffff) << 32))) || :
+		;;
+	100) # 0x64: pcmpgtb
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_byte_half 2 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_byte_half 2 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	101) # 0x65: pcmpgtw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_word_half 1 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_word_half 1 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	102) # 0x66: pcmpgtd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((((dlo & 0xffffffff) ^ 0x80000000) - 0x80000000) > (((slo & 0xffffffff) ^ 0x80000000) - 0x80000000) ? 0xffffffff : 0) |
+				((((((dlo >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) > ((((slo >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) ? 0xffffffff : 0) << 32),
+			xmm_hi[modrm_reg] = ((((dhi & 0xffffffff) ^ 0x80000000) - 0x80000000) > (((shi & 0xffffffff) ^ 0x80000000) - 0x80000000) ? 0xffffffff : 0) |
+				((((((dhi >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) > ((((shi >> 32) & 0xffffffff) ^ 0x80000000) - 0x80000000) ? 0xffffffff : 0) << 32))) || :
+		;;
+	104) # 0x68: punpckhbw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_unpack_bw "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		;;
+	105) # 0x69: punpckhwd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_unpack_wd "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		;;
+	106) # 0x6a: punpckhdq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = (dhi & 0xffffffff) | ((shi & 0xffffffff) << 32),
+			xmm_hi[modrm_reg] = ((dhi >> 32) & 0xffffffff) | (((shi >> 32) & 0xffffffff) << 32))) || :
+		;;
+	108) # 0x6c: punpcklqdq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_hi[modrm_reg] = slo)) || :
+		;;
+	109) # 0x6d: punpckhqdq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] = xmm_hi[modrm_reg], xmm_hi[modrm_reg] = shi)) || :
+		;;
+	110) # 0x6e: 66 movd / movq r/m -> xmm
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rex_w)); then
+			read_rm 8
+			((xmm_lo[modrm_reg] = val, xmm_hi[modrm_reg] = 0)) || :
+		else
+			read_rm 4
+			((xmm_lo[modrm_reg] = val & 0xffffffff, xmm_hi[modrm_reg] = 0)) || :
+		fi
+		;;
+	112) # 0x70: 66 pshufd / f2 pshuflw / f3 pshufhw imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		read_xmm_rm
+		disp8
+		((step_b = displacement & 0xff)) || :
+		if ((rep_prefix == 242)); then
+			((xmm_lo[modrm_reg] = ((slo >> (((step_b >> 0) & 3) * 16)) & 0xffff) |
+				(((slo >> (((step_b >> 2) & 3) * 16)) & 0xffff) << 16) |
+				(((slo >> (((step_b >> 4) & 3) * 16)) & 0xffff) << 32) |
+				(((slo >> (((step_b >> 6) & 3) * 16)) & 0xffff) << 48),
+				xmm_hi[modrm_reg] = shi)) || :
+		elif ((rep_prefix == 243)); then
+			((xmm_lo[modrm_reg] = slo,
+				xmm_hi[modrm_reg] = ((shi >> (((step_b >> 0) & 3) * 16)) & 0xffff) |
+					(((shi >> (((step_b >> 2) & 3) * 16)) & 0xffff) << 16) |
+					(((shi >> (((step_b >> 4) & 3) * 16)) & 0xffff) << 32) |
+					(((shi >> (((step_b >> 6) & 3) * 16)) & 0xffff) << 48))) || :
+		else
+			for ((_xi = 0; _xi < 4; _xi++)); do
+				((step_c = (step_b >> (_xi * 2)) & 3,
+					_xv = step_c < 2 ? ((slo >> (step_c * 32)) & 0xffffffff) : ((shi >> ((step_c - 2) * 32)) & 0xffffffff))) || :
+				case ${_xi} in
+				0) rlo=${_xv} ;;
+				1) ((rlo |= _xv << 32)) || : ;;
+				2) rhi=${_xv} ;;
+				3) ((rhi |= _xv << 32)) || : ;;
+				esac
+			done
+			((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		fi
+		;;
+	113) # 0x71: 66 group 12 (psrlw /2, psraw /4, psllw /6) imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		disp8
+		((step_b = displacement & 0xff)) || :
+		case $(((modrm >> 3) & 7)) in
+		2) sse_shift_xmm "${modrm_rm}" 0 "${step_b}" ;;
+		4) sse_shift_xmm "${modrm_rm}" 1 "${step_b}" ;;
+		6) sse_shift_xmm "${modrm_rm}" 2 "${step_b}" ;;
+		*) unknown_insruction "$(printf '66 0f 71 /%d' $(((modrm >> 3) & 7)))" "invalid SSE2 shift" ;;
+		esac
+		;;
+	114) # 0x72: 66 group 13 (psrld /2, psrad /4, pslld /6) imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		disp8
+		((step_b = displacement & 0xff)) || :
+		case $(((modrm >> 3) & 7)) in
+		2) sse_shift_xmm "${modrm_rm}" 3 "${step_b}" ;;
+		4) sse_shift_xmm "${modrm_rm}" 4 "${step_b}" ;;
+		6) sse_shift_xmm "${modrm_rm}" 5 "${step_b}" ;;
+		*) unknown_insruction "$(printf '66 0f 72 /%d' $(((modrm >> 3) & 7)))" "invalid SSE2 shift" ;;
+		esac
+		;;
+	115) # 0x73: 66 group 14 (psrlq /2, psrldq /3, psllq /6, pslldq /7) imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		disp8
+		((step_b = displacement & 0xff)) || :
+		case $(((modrm >> 3) & 7)) in
+		2) sse_shift_xmm "${modrm_rm}" 6 "${step_b}" ;;
+		6) sse_shift_xmm "${modrm_rm}" 7 "${step_b}" ;;
+		3) # psrldq (byte shift right)
+			((_xlo = xmm_lo[modrm_rm], _xhi = xmm_hi[modrm_rm])) || :
+			if ((step_b >= 16)); then
+				_xlo=0 _xhi=0
+			elif ((step_b == 8)); then
+				_xlo=${_xhi} _xhi=0
+			elif ((step_b > 8)); then
+				((_xv = (step_b - 8) * 8, _xmask = (1 << (64 - _xv)) - 1,
+					_xlo = (_xhi >> _xv) & _xmask, _xhi = 0)) || :
+			elif ((step_b > 0)); then
+				((_xv = step_b * 8, _xmask = (1 << (64 - _xv)) - 1,
+					_xlo = ((_xlo >> _xv) & _xmask) | (_xhi << (64 - _xv)),
+					_xhi = (_xhi >> _xv) & _xmask)) || :
+			fi
+			((xmm_lo[modrm_rm] = _xlo, xmm_hi[modrm_rm] = _xhi)) || :
+			;;
+		7) # pslldq (byte shift left)
+			((_xlo = xmm_lo[modrm_rm], _xhi = xmm_hi[modrm_rm])) || :
+			if ((step_b >= 16)); then
+				_xlo=0 _xhi=0
+			elif ((step_b == 8)); then
+				_xhi=${_xlo} _xlo=0
+			elif ((step_b > 8)); then
+				((_xv = (step_b - 8) * 8, _xhi = _xlo << _xv, _xlo = 0)) || :
+			elif ((step_b > 0)); then
+				((_xv = step_b * 8, _xmask = (1 << _xv) - 1,
+					_xhi = (_xhi << _xv) | ((_xlo >> (64 - _xv)) & _xmask),
+					_xlo = _xlo << _xv)) || :
+			fi
+			((xmm_lo[modrm_rm] = _xlo, xmm_hi[modrm_rm] = _xhi)) || :
+			;;
+		*) unknown_insruction "$(printf '66 0f 73 /%d' $(((modrm >> 3) & 7)))" "invalid SSE2 shift" ;;
+		esac
+		;;
+	116) # 0x74: 66 pcmpeqb (SWAR 8 bytes at a time)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7f7f7f7f7f7f7f7f,
+			_xda = xmm_lo[modrm_reg] ^ slo,
+			_xv = ~((((_xda & _xmask) + _xmask) | _xda) | _xmask),
+			xmm_lo[modrm_reg] = _xv | (((_xv >> 7) & 0x0101010101010101) * 0x7f),
+			_xda = xmm_hi[modrm_reg] ^ shi,
+			_xv = ~((((_xda & _xmask) + _xmask) | _xda) | _xmask),
+			xmm_hi[modrm_reg] = _xv | (((_xv >> 7) & 0x0101010101010101) * 0x7f))) || :
+		;;
+	117) # 0x75: 66 pcmpeqw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_word_half 0 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_word_half 0 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	118) # 0x76: 66 pcmpeqd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo & 0xffffffff) == (slo & 0xffffffff) ? 0xffffffff : 0) |
+				((((dlo >> 32) & 0xffffffff) == ((slo >> 32) & 0xffffffff) ? 0xffffffff : 0) << 32),
+			xmm_hi[modrm_reg] = ((dhi & 0xffffffff) == (shi & 0xffffffff) ? 0xffffffff : 0) |
+				((((dhi >> 32) & 0xffffffff) == ((shi >> 32) & 0xffffffff) ? 0xffffffff : 0) << 32))) || :
+		;;
+	126) # 0x7e: f3 movq xmm/m64->xmm | 66 movd/movq xmm->r/m
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rep_prefix == 243)); then
+			if ((modrm_mod == 3)); then
+				((slo = xmm_lo[modrm_rm])) || :
+			else
+				read_mem 8 "${modrm_address}"
+				slo=${val}
+			fi
+			((xmm_lo[modrm_reg] = slo, xmm_hi[modrm_reg] = 0)) || :
+		elif ((rex_w)); then
+			write_rm 8 "${xmm_lo[modrm_reg]}"
+		else
+			write_rm 4 "$((xmm_lo[modrm_reg] & 0xffffffff))"
+		fi
+		;;
+	162) # 0xa2: cpuid (baseline x86_64 + SSE + SSE2, no SSSE3/SSE4/AVX)
+		((step_a = registers[RAX] & 0xffffffff)) || :
+		case ${step_a} in
+		0)
+			write_reg 4 0 7
+			write_reg 4 3 $((0x756e6547)) # "Genu"
+			write_reg 4 2 $((0x49656e69)) # "ineI"
+			write_reg 4 1 $((0x6c65746e)) # "ntel"
+			;;
+		1)
+			write_reg 4 0 $((0x000006f1))
+			write_reg 4 3 $((0x00010800))
+			write_reg 4 1 $((1 << 23))    # POPCNT only; SSE3/SSSE3/SSE4/AVX = 0
+			write_reg 4 2 $((0x078bfbfd)) # FPU..SSE2
+			;;
+		$((0x80000000)))
+			write_reg 4 0 $((0x80000008))
+			write_reg 4 3 0
+			write_reg 4 1 0
+			write_reg 4 2 0
+			;;
+		$((0x80000001)))
+			write_reg 4 0 0
+			write_reg 4 3 0
+			write_reg 4 1 1                                  # LAHF_LM
+			write_reg 4 2 $(((1 << 29) | (1 << 20) | 0x800)) # LM | NX | SYSCALL
+			;;
+		$((0x80000008)))
+			write_reg 4 0 $((0x00003030))
+			write_reg 4 3 0
+			write_reg 4 1 0
+			write_reg 4 2 0
+			;;
+		*)
+			write_reg 4 0 0
+			write_reg 4 3 0
+			write_reg 4 1 0
+			write_reg 4 2 0
+			;;
+		esac
+		;;
+	163 | 171 | 179 | 187) # 0xa3 bt, 0xab bts, 0xb3 btr, 0xbb btc (r/m, r)
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_reg "${step_width}" "${modrm_reg}"
+		step_b=${val}
+		if ((modrm_mod == 3)); then
+			exec_bit_op "$(((step_op2 >> 3) & 3))" "${step_width}" "$((step_b & (step_width * 8 - 1)))" 0 0
+		else
+			sign_extend "${step_width}" "${step_b}"
+			((step_c = step_width == 2 ? 4 : step_width == 4 ? 5 : 6,
+				step_d = modrm_address + (val >> step_c) * step_width)) || :
+			exec_bit_op "$(((step_op2 >> 3) & 3))" "${step_width}" "$((val & (step_width * 8 - 1)))" 1 "${step_d}"
+		fi
+		;;
+	164 | 165 | 172 | 173) # 0xa4, 0xa5, 0xac, 0xad: shld, shrd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" "$((step_op2 & 1 ? 0 : 1))"
+		read_rm "${step_width}"
+		step_a=${val}
+		if ((step_op2 & 1)); then
+			((step_b = registers[RCX])) || :
+		else
+			disp8
+			step_b=${displacement}
+		fi
+		read_reg "${step_width}" "${modrm_reg}"
+		double_shift "$((step_op2 < 172))" "${step_width}" "${step_a}" "${val}" "${step_b}"
+		write_rm "${step_width}" "${val}"
+		;;
+	174) # 0xae: ldmxcsr / stmxcsr / lfence / mfence / sfence / clflush
+		((modrm = memory[rip + advance], advance++)) || :
+		if (((modrm >> 6) == 3)); then
+			if ((rep_prefix == 243)); then
+				# rdfsbase / rdgsbase / wrfsbase / wrgsbase
+				((step_a = (modrm & 7) | (rex_b << 3))) || :
+				case $(((modrm >> 3) & 7)) in
+				0) write_reg "${step_width}" "${step_a}" "${GLOBAL_fs_base}" ;;
+				1) write_reg "${step_width}" "${step_a}" "${GLOBAL_gs_base}" ;;
+				2) read_reg "${step_width}" "${step_a}"; GLOBAL_fs_base=${val} ;;
+				3) read_reg "${step_width}" "${step_a}"; GLOBAL_gs_base=${val} ;;
+				esac
+			fi
+		else
+			operands_modrm "${modrm}"
+			case $(((modrm >> 3) & 7)) in
+			2) read_mem 4 "${modrm_address}"; GLOBAL_mxcsr=${val} ;; # ldmxcsr
+			3) write_mem 4 "${modrm_address}" "${GLOBAL_mxcsr}" ;;   # stmxcsr
+			0 | 1 | 7) ;;                                            # fxsave/fxrstor/clflush no-op
+			*) unknown_insruction "$(printf '0f ae /%d' $(((modrm >> 3) & 7)))" "unsupported 0f ae" ;;
+			esac
+		fi
+		;;
+	175) # 0xaf: imul r, r/m
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		step_a=${val}
+		read_reg "${step_width}" "${modrm_reg}"
+		imul_op "${step_width}" "${val}" "${step_a}"
+		write_reg "${step_width}" "${modrm_reg}" "${prod_lo}"
+		;;
+	176 | 177) # 0xb0, 0xb1: cmpxchg r/m, r
+		((step_op2 == 176)) && step_width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		step_a=${val}
+		read_reg "${step_width}" 0
+		alu 7 "${step_width}" "${val}" "${step_a}"
+		if ((flag_zf)); then
+			read_reg "${step_width}" "${modrm_reg}"
+			write_rm "${step_width}" "${val}"
+		else
+			write_reg "${step_width}" 0 "${step_a}"
+		fi
+		;;
+	182 | 183 | 190 | 191) # 0xb6, 0xb7, 0xbe, 0xbf: movzx, movsx
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "$(((step_op2 & 1) + 1))"
+		if ((step_op2 & 8)); then
+			sign_extend "$(((step_op2 & 1) + 1))" "${val}"
+		fi
+		write_reg "${step_width}" "${modrm_reg}" "${val}"
+		;;
+	184) # 0xb8: f3 popcnt
+		((rep_prefix == 243)) || unknown_insruction "0f b8" "popcnt requires f3 prefix"
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		((_xda = val - ((val >> 1) & 0x5555555555555555),
+			_xda = (_xda & 0x3333333333333333) + ((_xda >> 2) & 0x3333333333333333),
+			_xda = (_xda + (_xda >> 4)) & 0x0f0f0f0f0f0f0f0f,
+			step_b = (_xda * 0x0101010101010101) >> 56 & 0xff,
+			flag_zf = val == 0, flag_cf = 0, flag_of = 0, flag_sf = 0, flag_af = 0, flag_pf = 0)) || :
+		write_reg "${step_width}" "${modrm_reg}" "${step_b}"
+		;;
+	186) # 0xba: group 8 bt/bts/btr/btc r/m, imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		disp8
+		((step_c = (modrm >> 3) & 7)) || :
+		((step_c >= 4)) || unknown_insruction "$(printf '0f ba /%d' $((step_c)))" "invalid group 8"
+		exec_bit_op "$((step_c & 3))" "${step_width}" "$((displacement & (step_width * 8 - 1)))" "$((modrm_mod != 3))" "${modrm_address}"
+		;;
+	188 | 189) # 0xbc bsf/tzcnt, 0xbd bsr/lzcnt
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		if ((rep_prefix == 243)); then
+			if ((val == 0)); then
+				flag_cf=1 flag_zf=0
+				write_reg "${step_width}" "${modrm_reg}" "$((step_width * 8))"
+			else
+				if ((step_op2 == 188)); then
+					for ((step_b = 0; !((val >> step_b) & 1); step_b++)); do :; done
+				else
+					for ((step_b = step_width * 8 - 1; !((val >> step_b) & 1); step_b--)); do :; done
+					((step_b = step_width * 8 - 1 - step_b)) || :
+				fi
+				((flag_cf = 0, flag_zf = step_b == 0)) || :
+				write_reg "${step_width}" "${modrm_reg}" "${step_b}"
+			fi
+		elif ((val == 0)); then
+			flag_zf=1
+		else
+			flag_zf=0
+			if ((step_op2 == 188)); then
+				for ((step_b = 0; !((val >> step_b) & 1); step_b++)); do :; done
+			else
+				for ((step_b = step_width * 8 - 1; !((val >> step_b) & 1); step_b--)); do :; done
+			fi
+			write_reg "${step_width}" "${modrm_reg}" "${step_b}"
+		fi
+		;;
+	192 | 193) # 0xc0, 0xc1: xadd r/m, r
+		((step_op2 == 192)) && step_width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		step_a=${val}
+		read_reg "${step_width}" "${modrm_reg}"
+		alu 0 "${step_width}" "${step_a}" "${val}"
+		step_b=${val}
+		write_reg "${step_width}" "${modrm_reg}" "${step_a}"
+		write_rm "${step_width}" "${step_b}"
+		;;
+	196) # 0xc4: 66 pinsrw xmm, r32/m16, imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		if ((modrm_mod == 3)); then
+			((step_a = registers[modrm_rm] & 0xffff)) || :
+		else
+			read_mem 2 "${modrm_address}"
+			step_a=${val}
+		fi
+		disp8
+		((step_b = displacement & 7)) || :
+		if ((step_b < 4)); then
+			((step_c = step_b * 16, xmm_lo[modrm_reg] = (xmm_lo[modrm_reg] & ~(0xffff << step_c)) | (step_a << step_c))) || :
+		else
+			((step_c = (step_b - 4) * 16, xmm_hi[modrm_reg] = (xmm_hi[modrm_reg] & ~(0xffff << step_c)) | (step_a << step_c))) || :
+		fi
+		;;
+	197) # 0xc5: 66 pextrw r32, xmm, imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		disp8
+		((step_b = displacement & 7)) || :
+		if ((step_b < 4)); then
+			write_reg 4 "${modrm_reg}" "$(((xmm_lo[modrm_rm] >> (step_b * 16)) & 0xffff))"
+		else
+			write_reg 4 "${modrm_reg}" "$(((xmm_hi[modrm_rm] >> ((step_b - 4) * 16)) & 0xffff))"
+		fi
+		;;
+	198) # 0xc6: shufps / 66 shufpd imm8
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" 1
+		read_xmm_rm
+		disp8
+		((step_b = displacement & 0xff, dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg])) || :
+		if ((operand_size_prefix)); then
+			((xmm_lo[modrm_reg] = (step_b & 1) ? dhi : dlo,
+				xmm_hi[modrm_reg] = (step_b & 2) ? shi : slo)) || :
+		else
+			((step_c = step_b & 3,
+				rlo = step_c < 2 ? ((dlo >> (step_c * 32)) & 0xffffffff) : ((dhi >> ((step_c - 2) * 32)) & 0xffffffff),
+				step_c = (step_b >> 2) & 3,
+				rlo |= (step_c < 2 ? ((dlo >> (step_c * 32)) & 0xffffffff) : ((dhi >> ((step_c - 2) * 32)) & 0xffffffff)) << 32,
+				step_c = (step_b >> 4) & 3,
+				rhi = step_c < 2 ? ((slo >> (step_c * 32)) & 0xffffffff) : ((shi >> ((step_c - 2) * 32)) & 0xffffffff),
+				step_c = (step_b >> 6) & 3,
+				rhi |= (step_c < 2 ? ((slo >> (step_c * 32)) & 0xffffffff) : ((shi >> ((step_c - 2) * 32)) & 0xffffffff)) << 32,
+				xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = rhi)) || :
+		fi
+		;;
+	200 | 201 | 202 | 203 | 204 | 205 | 206 | 207) # 0xc8-0xcf: bswap
+		((step_a = (step_op2 & 7) | (rex_b << 3), step_b = registers[step_a])) || :
+		if ((rex_w)); then
+			((registers[step_a] = ((step_b & 0xff) << 56) | (((step_b >> 8) & 0xff) << 48) |
+				(((step_b >> 16) & 0xff) << 40) | (((step_b >> 24) & 0xff) << 32) |
+				(((step_b >> 32) & 0xff) << 24) | (((step_b >> 40) & 0xff) << 16) |
+				(((step_b >> 48) & 0xff) << 8) | ((step_b >> 56) & 0xff))) || :
+		else
+			((registers[step_a] = (((step_b & 0xff) << 24) | (((step_b >> 8) & 0xff) << 16) |
+				(((step_b >> 16) & 0xff) << 8) | ((step_b >> 24) & 0xff)) & 0xffffffff)) || :
+		fi
+		;;
+	209) # 0xd1: 66 psrlw xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 0 "${slo}"
+		;;
+	210) # 0xd2: 66 psrld xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 3 "${slo}"
+		;;
+	211) # 0xd3: 66 psrlq xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 6 "${slo}"
+		;;
+	212) # 0xd4: 66 paddq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] += slo, xmm_hi[modrm_reg] += shi)) || :
+		;;
+	214) # 0xd6: 66 movq xmm -> xmm/m64
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((modrm_mod == 3)); then
+			((xmm_lo[modrm_rm] = xmm_lo[modrm_reg], xmm_hi[modrm_rm] = 0)) || :
+		else
+			write_mem 8 "${modrm_address}" "${xmm_lo[modrm_reg]}"
+		fi
+		;;
+	215) # 0xd7: 66 pmovmskb r32, xmm
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		((slo = xmm_lo[modrm_rm], shi = xmm_hi[modrm_rm],
+			step_a = (((slo >> 7) & 0x0101010101010101) * 0x0102040810204080 >> 56 & 0xff) |
+				((((shi >> 7) & 0x0101010101010101) * 0x0102040810204080 >> 56 & 0xff) << 8))) || :
+		write_reg 4 "${modrm_reg}" "${step_a}"
+		;;
+	216) # 0xd8: 66 psubusb
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_byte_half 3 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_byte_half 3 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	218) # 0xda: 66 pminub
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_byte_half 0 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_byte_half 0 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	220) # 0xdc: 66 paddusb
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_byte_half 4 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_byte_half 4 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	222) # 0xde: 66 pmaxub
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_byte_half 1 "${xmm_lo[modrm_reg]}" "${slo}"
+		rlo=${_xres}
+		sse_byte_half 1 "${xmm_hi[modrm_reg]}" "${shi}"
+		((xmm_lo[modrm_reg] = rlo, xmm_hi[modrm_reg] = _xres)) || :
+		;;
+	225) # 0xe1: 66 psraw xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 1 "${slo}"
+		;;
+	226) # 0xe2: 66 psrad xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 4 "${slo}"
+		;;
+	241) # 0xf1: 66 psllw xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 2 "${slo}"
+		;;
+	242) # 0xf2: 66 pslld xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 5 "${slo}"
+		;;
+	243) # 0xf3: 66 psllq xmm, xmm/m128
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		sse_shift_xmm "${modrm_reg}" 7 "${slo}"
+		;;
+	248) # 0xf8: 66 psubb
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7f7f7f7f7f7f7f7f,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo | ~_xmask) - (slo & _xmask)) ^ ((dlo ^ ~slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi | ~_xmask) - (shi & _xmask)) ^ ((dhi ^ ~shi) & ~_xmask))) || :
+		;;
+	249) # 0xf9: 66 psubw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7fff7fff7fff7fff,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo | ~_xmask) - (slo & _xmask)) ^ ((dlo ^ ~slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi | ~_xmask) - (shi & _xmask)) ^ ((dhi ^ ~shi) & ~_xmask))) || :
+		;;
+	250) # 0xfa: 66 psubd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7fffffff7fffffff,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo | ~_xmask) - (slo & _xmask)) ^ ((dlo ^ ~slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi | ~_xmask) - (shi & _xmask)) ^ ((dhi ^ ~shi) & ~_xmask))) || :
+		;;
+	251) # 0xfb: 66 psubq
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((xmm_lo[modrm_reg] -= slo, xmm_hi[modrm_reg] -= shi)) || :
+		;;
+	252) # 0xfc: 66 paddb
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7f7f7f7f7f7f7f7f,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo & _xmask) + (slo & _xmask)) ^ ((dlo ^ slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi & _xmask) + (shi & _xmask)) ^ ((dhi ^ shi) & ~_xmask))) || :
+		;;
+	253) # 0xfd: 66 paddw
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7fff7fff7fff7fff,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo & _xmask) + (slo & _xmask)) ^ ((dlo ^ slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi & _xmask) + (shi & _xmask)) ^ ((dhi ^ shi) & ~_xmask))) || :
+		;;
+	254) # 0xfe: 66 paddd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_xmm_rm
+		((_xmask = 0x7fffffff7fffffff,
+			dlo = xmm_lo[modrm_reg], dhi = xmm_hi[modrm_reg],
+			xmm_lo[modrm_reg] = ((dlo & _xmask) + (slo & _xmask)) ^ ((dlo ^ slo) & ~_xmask),
+			xmm_hi[modrm_reg] = ((dhi & _xmask) + (shi & _xmask)) ^ ((dhi ^ shi) & ~_xmask))) || :
+		;;
+	*)
+		unknown_insruction "$(printf '0f %02x' $((step_op2)))" "unsupported 2 byte instruction"
+		;;
+	esac
 }
 
 # Executes the instruction at `rip` and moves `rip` to the next instruction.
 function step() {
-	declare -i op op2 modrm width imm_bytes a b displacement rep_prefix=0
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
-	advance=0
-
-	# Prefixes
-	while true; do
-		((op = memory[rip + advance])) || :
-		((advance++)) || :
-		if (((op & 0xf0) == 0x40)); then
-			((rex = op, rex_w = op >> 3 & 1, rex_r = op >> 2 & 1, rex_x = op >> 1 & 1, rex_b = op & 1)) || :
-			continue
-		fi
-		case $((op)) in
-		$((0x66))) operand_size_prefix=1 ;;
-		$((0xf2)) | $((0xf3))) rep_prefix=$((op)) ;;
-		# cs, ds, es, ss segment overrides are no-ops in 64-bit mode. lock is
-		# irrelevant to a single threaded emulator.
-		$((0x2e)) | $((0x3e)) | $((0x26)) | $((0x36)) | $((0xf0))) ;;
-		*) break ;;
-		esac
-		# A legacy prefix after REX cancels REX.
+	((step_op = memory[rip], advance = 1)) || :
+	if (((step_op & 0xf0) == 0x40)); then
+		((rex = step_op, rex_w = (step_op >> 3) & 1, rex_r = (step_op >> 2) & 1,
+			rex_x = (step_op >> 1) & 1, rex_b = step_op & 1,
+			step_op = memory[rip + 1], advance = 2)) || :
+	else
 		rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0
-	done
+	fi
+	operand_size_prefix=0 addr_size_prefix=0 seg_override=0 seg_base=0 rep_prefix=0
 
-	if [[ ${enable_debug_messages} = true ]]; then
-		debug "rip=0x%x opcode=0x%02x" $((rip)) $((op))
+	# Full prefix loop when legacy or multiple prefixes are present.
+	if (((step_op & 0xfc) == 0x64 || (step_op & 0xf0) == 0x40 || step_op == 0xf0 || step_op == 0xf2 || step_op == 0xf3 || (step_op & 0xe7) == 0x26)); then
+		rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 advance=0
+		while :; do
+			((step_op = memory[rip + advance], advance++)) || :
+			if (((step_op & 0xf0) == 0x40)); then
+				((rex = step_op, rex_w = (step_op >> 3) & 1, rex_r = (step_op >> 2) & 1,
+					rex_x = (step_op >> 1) & 1, rex_b = step_op & 1)) || :
+				continue
+			fi
+			case ${step_op} in
+			102) operand_size_prefix=1 ;;                       # 0x66
+			103) addr_size_prefix=1 ;;                          # 0x67
+			242 | 243) rep_prefix=${step_op} ;;                 # 0xf2, 0xf3
+			100) seg_override=100 seg_base=${GLOBAL_fs_base} ;; # 0x64 (FS)
+			101) seg_override=101 seg_base=${GLOBAL_gs_base} ;; # 0x65 (GS)
+			46 | 62 | 38 | 54) seg_override=0 seg_base=0 ;;     # 0x2e, 0x3e, 0x26, 0x36 (CS/DS/ES/SS)
+			240) ;;                                             # 0xf0 (LOCK)
+			*) break ;;
+			esac
+			# A legacy prefix after REX cancels REX.
+			rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0
+		done
 	fi
 
-	((width = rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
+	if [[ ${enable_debug_messages} = true ]]; then
+		debug "rip=0x%x opcode=0x%02x" $((rip)) $((step_op))
+	fi
+
+	((step_width = rex_w ? 8 : operand_size_prefix ? 2 : 4)) || :
 
 	# add/or/adc/sbb/and/sub/xor/cmp: 00-05, 08-0D, ... 38-3D
-	if ((op < 0x40 && (op & 0x7) < 6)); then
-		if (((op & 0x7) < 4)); then
-			((modrm = memory[rip + advance], advance++)) || :
-			inst_binary_op $((op)) $((modrm))
+	if ((step_op < 64 && (step_op & 7) < 6)); then
+		if (((step_op & 7) < 4)); then
+			((modrm = memory[rip + advance], advance++,
+				_ibo_op = (step_op >> 3) & 7,
+				_ibo_w = (step_op & 1) == 0 ? 1 : step_width)) || :
+			if ((modrm >= 192 && _ibo_w >= 4)); then
+				((modrm_reg = ((modrm >> 3) & 7) | (rex_r << 3),
+					modrm_rm = (modrm & 7) | (rex_b << 3),
+					_ibo_a = _ibo_w == 8 ? registers[modrm_rm] : (registers[modrm_rm] & 0xffffffff),
+					_ibo_b = _ibo_w == 8 ? registers[modrm_reg] : (registers[modrm_reg] & 0xffffffff))) || :
+				if (((step_op >> 1) & 1)); then
+					alu "${_ibo_op}" "${_ibo_w}" "${_ibo_b}" "${_ibo_a}"
+					if ((_ibo_op != 7)); then
+						((registers[modrm_reg] = _ibo_w == 8 ? val : (val & 0xffffffff))) || :
+					fi
+				else
+					alu "${_ibo_op}" "${_ibo_w}" "${_ibo_a}" "${_ibo_b}"
+					if ((_ibo_op != 7)); then
+						((registers[modrm_rm] = _ibo_w == 8 ? val : (val & 0xffffffff))) || :
+					fi
+				fi
+			else
+				inst_binary_op "${step_op}" "${modrm}"
+			fi
 		else
 			# AL/eAX, imm
-			(((op & 1) == 0)) && width=1
-			disp_width $((width == 8 ? 4 : width))
-			read_reg $((width)) $((RAX))
-			alu $((op >> 3)) $((width)) $((val)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
-			(((op >> 3) == 7)) || write_reg $((width)) $((RAX)) $((val))
+			(((step_op & 1) == 0)) && step_width=1
+			disp_width "$((step_width == 8 ? 4 : step_width))"
+			read_reg "${step_width}" 0
+			alu "$((step_op >> 3))" "${step_width}" "${val}" "$((displacement & (step_width == 8 ? -1 : (1 << (step_width * 8)) - 1)))"
+			if (((step_op >> 3) != 7)); then
+				write_reg "${step_width}" 0 "${val}"
+			fi
 		fi
 		((rip += advance)) || :
 		return 0
 	fi
 
-	case $((op)) in
-	$((0x0f)))
-		((op2 = memory[rip + advance], advance++)) || :
-		case $((op2 & 0xf0)) in
-		$((0x40))) # cmovcc
-			((modrm = memory[rip + advance], advance++)) || :
-			operands_modrm $((modrm))
-			read_rm $((width))
-			eval_cond $((op2))
-			if ((cond)); then
-				write_reg $((width)) $((modrm_reg)) $((val))
-			elif ((width == 4)); then
-				# Upper bits are cleared even if the condition is false.
-				read_reg 4 $((modrm_reg))
-				write_reg 4 $((modrm_reg)) $((val))
+	case ${step_op} in
+	136 | 137 | 138 | 139) # 0x88-0x8b: mov r/m, r and mov r, r/m
+		((modrm = memory[rip + advance], advance++,
+			_ibo_w = (step_op & 1) == 0 ? 1 : step_width)) || :
+		if ((modrm >= 192 && _ibo_w >= 4)); then
+			((modrm_reg = ((modrm >> 3) & 7) | (rex_r << 3),
+				modrm_rm = (modrm & 7) | (rex_b << 3))) || :
+			if (((step_op >> 1) & 1)); then
+				((registers[modrm_reg] = _ibo_w == 8 ? registers[modrm_rm] : (registers[modrm_rm] & 0xffffffff))) || :
+			else
+				((registers[modrm_rm] = _ibo_w == 8 ? registers[modrm_reg] : (registers[modrm_reg] & 0xffffffff))) || :
 			fi
-			;;
-		$((0x80))) # jcc rel32
-			disp32
-			eval_cond $((op2))
-			if ((cond)); then ((advance += displacement)) || :; fi
-			;;
-		$((0x90))) # setcc
-			((modrm = memory[rip + advance], advance++)) || :
-			operands_modrm $((modrm))
-			eval_cond $((op2))
-			write_rm 1 $((cond))
-			;;
-		*)
-			case $((op2)) in
-			$((0x05)))
-				inst_syscall
-				;;
-			$((0x18)) | $((0x19)) | $((0x1a)) | $((0x1b)) | $((0x1c)) | $((0x1d)) | $((0x1e)) | $((0x1f)))
-				# Hint nops: nopw/nopl, prefetch, endbr64 (f3 0f 1e fa)...
-				((modrm = memory[rip + advance], advance++)) || :
-				operands_modrm $((modrm))
-				;;
-			$((0xaf))) # imul r, r/m
-				((modrm = memory[rip + advance], advance++)) || :
-				operands_modrm $((modrm))
-				read_rm $((width))
-				((a = val)) || :
-				read_reg $((width)) $((modrm_reg))
-				imul_op $((width)) $((val)) $((a))
-				write_reg $((width)) $((modrm_reg)) $((prod_lo))
-				;;
-			$((0xa4)) | $((0xa5)) | $((0xac)) | $((0xad))) # shld, shrd
-				((modrm = memory[rip + advance], advance++)) || :
-				operands_modrm $((modrm)) $((op2 & 1 ? 0 : 1))
-				read_rm $((width))
-				((a = val)) || :
-				if ((op2 & 1)); then
-					((b = registers[RCX])) || :
-				else
-					disp8
-					((b = displacement)) || :
-				fi
-				read_reg $((width)) $((modrm_reg))
-				double_shift $((op2 < 0xac)) $((width)) $((a)) $((val)) $((b))
-				write_rm $((width)) $((val))
-				;;
-			$((0xbc)) | $((0xbd))) # bsf, bsr
-				((modrm = memory[rip + advance], advance++)) || :
-				operands_modrm $((modrm))
-				read_rm $((width))
-				if ((val == 0)); then
-					flag_zf=1
-				else
-					flag_zf=0
-					if ((op2 == 0xbc)); then
-						for ((b = 0; !((val >> b) & 1); b++)); do :; done
-					else
-						for ((b = width * 8 - 1; !((val >> b) & 1); b--)); do :; done
-					fi
-					write_reg $((width)) $((modrm_reg)) $((b))
-				fi
-				;;
-			$((0xb6)) | $((0xb7)) | $((0xbe)) | $((0xbf))) # movzx, movsx
-				((modrm = memory[rip + advance], advance++)) || :
-				operands_modrm $((modrm))
-				read_rm $(((op2 & 1) + 1))
-				if ((op2 & 0x8)); then
-					sign_extend $(((op2 & 1) + 1)) $((val))
-				fi
-				write_reg $((width)) $((modrm_reg)) $((val))
-				;;
-			*)
-				unknown_insruction "$(printf '0f %02x' $((op2)))" "unsupported 2 byte instruction"
-				;;
-			esac
-			;;
-		esac
-		;;
-	$((0x50)) | $((0x51)) | $((0x52)) | $((0x53)) | $((0x54)) | $((0x55)) | $((0x56)) | $((0x57)))
-		inst_push $((op & 0x7 | rex_b << 3))
-		;;
-	$((0x58)) | $((0x59)) | $((0x5a)) | $((0x5b)) | $((0x5c)) | $((0x5d)) | $((0x5e)) | $((0x5f)))
-		pop64
-		write_reg 8 $((op & 0x7 | rex_b << 3)) $((val))
-		;;
-	$((0x63))) # movsxd
-		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm))
-		if ((rex_w)); then
-			read_rm 4
-			sign_extend 4 $((val))
 		else
-			read_rm $((width))
+			operands_modrm "${modrm}"
+			if (((step_op >> 1) & 1)); then
+				read_rm "${_ibo_w}"
+				write_reg "${_ibo_w}" "${modrm_reg}" "${val}"
+			else
+				read_reg "${_ibo_w}" "${modrm_reg}"
+				write_rm "${_ibo_w}" "${val}"
+			fi
 		fi
-		write_reg $((width)) $((modrm_reg)) $((val))
 		;;
-	$((0x68)) | $((0x6a))) # push imm32/imm8
-		disp_width $((op == 0x68 ? 4 : 1))
-		push64 $((displacement))
-		;;
-	$((0x69)) | $((0x6b))) # imul r, r/m, imm
-		((imm_bytes = op == 0x6b ? 1 : $((width == 8 ? 4 : width)))) || :
+	141) # 0x8d: lea (effective offset without segment base)
 		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm)) $((imm_bytes))
-		read_rm $((width))
-		((a = val)) || :
-		disp_width $((imm_bytes))
-		imul_op $((width)) $((a)) $((displacement))
-		write_reg $((width)) $((modrm_reg)) $((prod_lo))
+		seg_base=0
+		operands_modrm "${modrm}"
+		write_reg "${step_width}" "${modrm_reg}" "${modrm_address}"
 		;;
-	$((0x70)) | $((0x71)) | $((0x72)) | $((0x73)) | $((0x74)) | $((0x75)) | $((0x76)) | $((0x77)) | \
-		$((0x78)) | $((0x79)) | $((0x7a)) | $((0x7b)) | $((0x7c)) | $((0x7d)) | $((0x7e)) | $((0x7f)))
-		disp8
-		eval_cond $((op))
+	116) # 0x74: je / jz rel8
+		((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance += 1 + (flag_zf ? displacement : 0))) || :
+		;;
+	117) # 0x75: jne / jnz rel8
+		((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance += 1 + (flag_zf ? 0 : displacement))) || :
+		;;
+	112 | 113 | 114 | 115 | 118 | 119 | 120 | 121 | 122 | 123 | 124 | 125 | 126 | 127) # other jcc rel8
+		((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance++)) || :
+		eval_cond "${step_op}"
 		if ((cond)); then ((advance += displacement)) || :; fi
 		;;
-	$((0x80)) | $((0x81)) | $((0x83))) # group 1: alu r/m, imm
-		((op == 0x80)) && width=1
-		((imm_bytes = op == 0x81 ? $((width == 8 ? 4 : width)) : 1)) || :
-		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm)) $((imm_bytes))
-		read_rm $((width))
-		((a = val)) || :
-		disp_width $((imm_bytes))
-		alu $((modrm >> 3 & 7)) $((width)) $((a)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
-		(((modrm >> 3 & 7) == 7)) || write_rm $((width)) $((val))
-		;;
-	$((0x84)) | $((0x85))) # test r/m, r
-		((modrm = memory[rip + advance], advance++)) || :
-		inst_binary_op $((op)) $((modrm))
-		;;
-	$((0x86)) | $((0x87))) # xchg r/m, r
-		((op == 0x86)) && width=1
-		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm))
-		read_rm $((width))
-		((a = val)) || :
-		read_reg $((width)) $((modrm_reg))
-		write_rm $((width)) $((val))
-		write_reg $((width)) $((modrm_reg)) $((a))
-		;;
-	$((0x88)) | $((0x89)) | $((0x8a)) | $((0x8b)))
-		((modrm = memory[rip + advance], advance++)) || :
-		inst_mov $((op)) $((modrm))
-		;;
-	$((0x8d)))
-		((modrm = memory[rip + advance], advance++)) || :
-		inst_lea $((op)) $((modrm))
-		;;
-	$((0x8f))) # pop r/m64
-		((modrm = memory[rip + advance], advance++)) || :
-		pop64
-		((a = val)) || :
-		operands_modrm $((modrm))
-		write_rm 8 $((a))
-		;;
-	$((0x90)) | $((0x91)) | $((0x92)) | $((0x93)) | $((0x94)) | $((0x95)) | $((0x96)) | $((0x97)))
-		# xchg rAX, r. 0x90 without REX.B is nop (or pause with f3).
-		if (((op & 0x7 | rex_b << 3) != RAX)); then
-			read_reg $((width)) $((RAX))
-			((a = val)) || :
-			read_reg $((width)) $((op & 0x7 | rex_b << 3))
-			write_reg $((width)) $((RAX)) $((val))
-			write_reg $((width)) $((op & 0x7 | rex_b << 3)) $((a))
+	128 | 129 | 131) # 0x80, 0x81, 0x83: group 1 alu r/m, imm
+		((step_op == 128)) && step_width=1
+		((step_imm_bytes = step_op == 129 ? (step_width == 8 ? 4 : step_width) : 1,
+			modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" "${step_imm_bytes}"
+		read_rm "${step_width}"
+		step_a=${val}
+		disp_width "${step_imm_bytes}"
+		alu "$(((modrm >> 3) & 7))" "${step_width}" "${step_a}" "$((displacement & (step_width == 8 ? -1 : (1 << (step_width * 8)) - 1)))"
+		if ((((modrm >> 3) & 7) != 7)); then
+			write_rm "${step_width}" "${val}"
 		fi
 		;;
-	$((0x98))) # cbw, cwde, cdqe
-		read_reg $((width / 2)) $((RAX))
-		sign_extend $((width / 2)) $((val))
-		write_reg $((width)) $((RAX)) $((val))
-		;;
-	$((0x99))) # cwd, cdq, cqo
-		read_reg $((width)) $((RAX))
-		write_reg $((width)) $((RDX)) $(((val >> (width * 8 - 1) & 1) ? -1 : 0))
-		;;
-	$((0xa4)) | $((0xa5)) | $((0xaa)) | $((0xab))) # movs, stos
-		(((op & 1) == 0)) && width=1
-		while ((!rep_prefix || registers[RCX] != 0)); do
-			if ((op >= 0xaa)); then
-				read_reg $((width)) $((RAX))
-			else
-				read_mem $((width)) $((registers[RSI]))
-				((registers[RSI] += flag_df ? -width : width)) || :
-			fi
-			write_mem $((width)) $((registers[RDI])) $((val))
-			((registers[RDI] += flag_df ? -width : width)) || :
-			((rep_prefix)) || break
-			((registers[RCX]--)) || :
-		done
-		;;
-	$((0xa8)) | $((0xa9))) # test al/eAX, imm
-		((op == 0xa8)) && width=1
-		disp_width $((width == 8 ? 4 : width))
-		read_reg $((width)) $((RAX))
-		alu 4 $((width)) $((val)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
-		;;
-	$((0xb0)) | $((0xb1)) | $((0xb2)) | $((0xb3)) | $((0xb4)) | $((0xb5)) | $((0xb6)) | $((0xb7)) | \
-		$((0xb8)) | $((0xb9)) | $((0xba)) | $((0xbb)) | $((0xbc)) | $((0xbd)) | $((0xbe)) | $((0xbf)))
-		inst_mov_imm $((op))
-		;;
-	$((0xc0)) | $((0xc1)) | $((0xd0)) | $((0xd1)) | $((0xd2)) | $((0xd3))) # group 2: shifts
-		(((op & 1) == 0)) && width=1
+	132 | 133) # 0x84, 0x85: test r/m, r
 		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm)) $((op < 0xd0 ? 1 : 0))
-		read_rm $((width))
-		((a = val)) || :
-		if ((op < 0xd0)); then
-			disp8
-			((b = displacement & 0xff)) || :
-		elif ((op < 0xd2)); then
-			b=1
-		else
-			((b = registers[RCX] & 0xff)) || :
-		fi
-		shift_op $((modrm >> 3 & 7)) $((width)) $((a)) $((b))
-		write_rm $((width)) $((val))
+		inst_binary_op "${step_op}" "${modrm}"
 		;;
-	$((0xc2)) | $((0xc3))) # ret, ret imm16
-		if ((op == 0xc2)); then
-			disp16
-			((b = displacement & 0xffff)) || :
-		else
-			b=0
-		fi
+	15) # 0x0f: two-byte instructions
+		step_0f
+		;;
+	80 | 81 | 82 | 83 | 84 | 85 | 86 | 87) # 0x50-0x57: push r64
+		push64 "${registers[(step_op & 7) | (rex_b << 3)]}"
+		;;
+	88 | 89 | 90 | 91 | 92 | 93 | 94 | 95) # 0x58-0x5f: pop r64
 		pop64
-		((registers[RSP] += b)) || :
-		((advance = val - rip)) || :
+		((registers[(step_op & 7) | (rex_b << 3)] = val)) || :
 		;;
-	$((0xc6)) | $((0xc7))) # mov r/m, imm
-		((op == 0xc6)) && width=1
-		((imm_bytes = op == 0xc6 ? 1 : $((width == 8 ? 4 : width)))) || :
+	176 | 177 | 178 | 179 | 180 | 181 | 182 | 183 | 184 | 185 | 186 | 187 | 188 | 189 | 190 | 191) # 0xb0-0xbf: mov reg, imm
+		inst_mov_imm "${step_op}"
+		;;
+	254 | 255) # 0xfe, 0xff: group 4/5
+		((step_op == 254)) && step_width=1
 		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm)) $((imm_bytes))
-		disp_width $((imm_bytes))
-		write_rm $((width)) $((displacement))
-		;;
-	$((0xc9))) # leave
-		((registers[RSP] = registers[RBP])) || :
-		pop64
-		((registers[RBP] = val)) || :
-		;;
-	$((0xe8))) # call rel32
-		disp32
-		push64 $((rip + advance))
-		((advance += displacement)) || :
-		;;
-	$((0xe9))) # jmp rel32
-		disp32
-		((advance += displacement)) || :
-		;;
-	$((0xeb))) # jmp rel8
-		disp8
-		((advance += displacement)) || :
-		;;
-	$((0xf5))) ((flag_cf = !flag_cf)) || : ;; # cmc
-	$((0xf8))) flag_cf=0 ;;                     # clc
-	$((0xf9))) flag_cf=1 ;;                     # stc
-	$((0xfc))) flag_df=0 ;;                     # cld
-	$((0xfd))) flag_df=1 ;;                     # std
-	$((0xf6)) | $((0xf7))) # group 3
-		((op == 0xf6)) && width=1
-		((modrm = memory[rip + advance], advance++)) || :
-		((imm_bytes = (modrm >> 3 & 7) < 2 ? $((width == 8 ? 4 : width)) : 0)) || :
-		operands_modrm $((modrm)) $((imm_bytes))
-		read_rm $((width))
-		((a = val)) || :
-		case $((modrm >> 3 & 7)) in
-		0 | 1) # test
-			disp_width $((imm_bytes))
-			alu 4 $((width)) $((a)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
-			;;
-		2) # not
-			write_rm $((width)) $((~a))
-			;;
-		3) # neg
-			alu 5 $((width)) 0 $((a))
-			write_rm $((width)) $((val))
-			;;
-		*)
-			inst_muldiv $((modrm >> 3 & 7)) $((width)) $((a))
-			;;
-		esac
-		;;
-	$((0xfe)) | $((0xff))) # group 4/5
-		((op == 0xfe)) && width=1
-		((modrm = memory[rip + advance], advance++)) || :
-		operands_modrm $((modrm))
-		case $((modrm >> 3 & 7)) in
+		operands_modrm "${modrm}"
+		case $(((modrm >> 3) & 7)) in
 		0 | 1) # inc, dec: CF is preserved.
-			read_rm $((width))
-			((b = flag_cf)) || :
-			alu $(((modrm >> 3 & 7) ? 5 : 0)) $((width)) $((val)) 1
-			((flag_cf = b)) || :
-			write_rm $((width)) $((val))
+			read_rm "${step_width}"
+			step_b=${flag_cf}
+			alu "$((((modrm >> 3) & 7) ? 5 : 0))" "${step_width}" "${val}" 1
+			flag_cf=${step_b}
+			write_rm "${step_width}" "${val}"
 			;;
 		2) # call r/m64
-			((op == 0xff)) || unknown_insruction "fe /2" "invalid"
+			((step_op == 255)) || unknown_insruction "fe /2" "invalid"
 			read_rm 8
-			((a = val)) || :
-			push64 $((rip + advance))
-			((advance = a - rip)) || :
+			step_a=${val}
+			push64 "$((rip + advance))"
+			((advance = step_a - rip)) || :
 			;;
 		4) # jmp r/m64
-			((op == 0xff)) || unknown_insruction "fe /4" "invalid"
+			((step_op == 255)) || unknown_insruction "fe /4" "invalid"
 			read_rm 8
 			((advance = val - rip)) || :
 			;;
 		6) # push r/m64
-			((op == 0xff)) || unknown_insruction "fe /6" "invalid"
+			((step_op == 255)) || unknown_insruction "fe /6" "invalid"
 			read_rm 8
-			push64 $((val))
+			push64 "${val}"
 			;;
 		*)
-			unknown_insruction "$(printf '%02x /%d' $((op)) $((modrm >> 3 & 7)))" "unsupported group 5 instruction"
+			unknown_insruction "$(printf '%02x /%d' $((step_op)) $(((modrm >> 3) & 7)))" "unsupported group 5 instruction"
 			;;
 		esac
 		;;
+	232) # 0xe8: call rel32
+		disp32
+		push64 "$((rip + advance))"
+		((advance += displacement)) || :
+		;;
+	233) # 0xe9: jmp rel32
+		disp32
+		((advance += displacement)) || :
+		;;
+	235) # 0xeb: jmp rel8
+		((displacement = (memory[rip + advance] ^ 0x80) - 0x80, advance += 1 + displacement)) || :
+		;;
+	194 | 195) # 0xc2, 0xc3: ret, ret imm16
+		if ((step_op == 194)); then
+			disp16
+			((step_b = displacement & 0xffff)) || :
+		else
+			step_b=0
+		fi
+		pop64
+		((registers[RSP] += step_b, advance = val - rip)) || :
+		;;
+	198 | 199) # 0xc6, 0xc7: mov r/m, imm
+		((step_op == 198)) && step_width=1
+		((step_imm_bytes = step_op == 198 ? 1 : (step_width == 8 ? 4 : step_width),
+			modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" "${step_imm_bytes}"
+		disp_width "${step_imm_bytes}"
+		write_rm "${step_width}" "${displacement}"
+		;;
+	192 | 193 | 208 | 209 | 210 | 211) # 0xc0, 0xc1, 0xd0-0xd3: group 2 shifts
+		(((step_op & 1) == 0)) && step_width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" "$((step_op < 208 ? 1 : 0))"
+		read_rm "${step_width}"
+		step_a=${val}
+		if ((step_op < 208)); then
+			disp8
+			((step_b = displacement & 0xff)) || :
+		elif ((step_op < 210)); then
+			step_b=1
+		else
+			((step_b = registers[RCX] & 0xff)) || :
+		fi
+		shift_op "$(((modrm >> 3) & 7))" "${step_width}" "${step_a}" "${step_b}"
+		write_rm "${step_width}" "${val}"
+		;;
+	246 | 247) # 0xf6, 0xf7: group 3
+		((step_op == 246)) && step_width=1
+		((modrm = memory[rip + advance], advance++,
+			step_imm_bytes = ((modrm >> 3) & 7) < 2 ? (step_width == 8 ? 4 : step_width) : 0)) || :
+		operands_modrm "${modrm}" "${step_imm_bytes}"
+		read_rm "${step_width}"
+		step_a=${val}
+		case $(((modrm >> 3) & 7)) in
+		0 | 1) # test
+			disp_width "${step_imm_bytes}"
+			alu 4 "${step_width}" "${step_a}" "$((displacement & (step_width == 8 ? -1 : (1 << (step_width * 8)) - 1)))"
+			;;
+		2) # not
+			write_rm "${step_width}" "$((~step_a))"
+			;;
+		3) # neg
+			alu 5 "${step_width}" 0 "${step_a}"
+			write_rm "${step_width}" "${val}"
+			;;
+		*)
+			inst_muldiv "$(((modrm >> 3) & 7))" "${step_width}" "${step_a}"
+			;;
+		esac
+		;;
+	99) # 0x63: movsxd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		if ((rex_w)); then
+			read_rm 4
+			sign_extend 4 "${val}"
+		else
+			read_rm "${step_width}"
+		fi
+		write_reg "${step_width}" "${modrm_reg}" "${val}"
+		;;
+	104 | 106) # 0x68, 0x6a: push imm32/imm8
+		disp_width "$((step_op == 104 ? 4 : 1))"
+		push64 "${displacement}"
+		;;
+	105 | 107) # 0x69, 0x6b: imul r, r/m, imm
+		((step_imm_bytes = step_op == 107 ? 1 : (step_width == 8 ? 4 : step_width),
+			modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}" "${step_imm_bytes}"
+		read_rm "${step_width}"
+		step_a=${val}
+		disp_width "${step_imm_bytes}"
+		imul_op "${step_width}" "${step_a}" "${displacement}"
+		write_reg "${step_width}" "${modrm_reg}" "${prod_lo}"
+		;;
+	134 | 135) # 0x86, 0x87: xchg r/m, r
+		((step_op == 134)) && step_width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm "${modrm}"
+		read_rm "${step_width}"
+		step_a=${val}
+		read_reg "${step_width}" "${modrm_reg}"
+		write_rm "${step_width}" "${val}"
+		write_reg "${step_width}" "${modrm_reg}" "${step_a}"
+		;;
+	143) # 0x8f: pop r/m64
+		((modrm = memory[rip + advance], advance++)) || :
+		pop64
+		step_a=${val}
+		operands_modrm "${modrm}"
+		write_rm 8 "${step_a}"
+		;;
+	144 | 145 | 146 | 147 | 148 | 149 | 150 | 151) # 0x90-0x97: nop / pause / xchg rAX, r
+		if ((((step_op & 7) | (rex_b << 3)) != 0)); then
+			read_reg "${step_width}" 0
+			step_a=${val}
+			read_reg "${step_width}" "$(((step_op & 7) | (rex_b << 3)))"
+			write_reg "${step_width}" 0 "${val}"
+			write_reg "${step_width}" "$(((step_op & 7) | (rex_b << 3)))" "${step_a}"
+		fi
+		;;
+	152) # 0x98: cbw, cwde, cdqe
+		read_reg "$((step_width / 2))" 0
+		sign_extend "$((step_width / 2))" "${val}"
+		write_reg "${step_width}" 0 "${val}"
+		;;
+	153) # 0x99: cwd, cdq, cqo
+		read_reg "${step_width}" 0
+		write_reg "${step_width}" 2 "$((((val >> (step_width * 8 - 1)) & 1) ? -1 : 0))"
+		;;
+	156) # 0x9c: pushfq / pushfw
+		((step_a = flag_cf | 2 | (flag_pf << 2) | (flag_af << 4) | (flag_zf << 6) |
+			(flag_sf << 7) | (flag_df << 10) | (flag_of << 11))) || :
+		if ((operand_size_prefix)); then
+			((registers[RSP] -= 2)) || :
+			write_mem 2 "${registers[RSP]}" "$((step_a & 0xffff))"
+		else
+			push64 "${step_a}"
+		fi
+		;;
+	157) # 0x9d: popfq / popfw
+		if ((operand_size_prefix)); then
+			read_mem 2 "${registers[RSP]}"
+			((registers[RSP] += 2)) || :
+		else
+			pop64
+		fi
+		((flag_cf = val & 1, flag_pf = (val >> 2) & 1, flag_af = (val >> 4) & 1,
+			flag_zf = (val >> 6) & 1, flag_sf = (val >> 7) & 1,
+			flag_df = (val >> 10) & 1, flag_of = (val >> 11) & 1)) || :
+		;;
+	158) # 0x9e: sahf
+		((step_a = (registers[RAX] >> 8) & 0xff,
+			flag_cf = step_a & 1, flag_pf = (step_a >> 2) & 1,
+			flag_af = (step_a >> 4) & 1, flag_zf = (step_a >> 6) & 1,
+			flag_sf = (step_a >> 7) & 1)) || :
+		;;
+	159) # 0x9f: lahf
+		((step_a = flag_cf | 2 | (flag_pf << 2) | (flag_af << 4) | (flag_zf << 6) | (flag_sf << 7),
+			registers[RAX] = (registers[RAX] & ~0xff00) | (step_a << 8))) || :
+		;;
+	160 | 161 | 162 | 163) # 0xa0-0xa3: mov AL/rAX, moffs / mov moffs, AL/rAX
+		(((step_op & 1) == 0)) && step_width=1
+		if ((addr_size_prefix)); then
+			((_da = rip + advance,
+				step_a = (memory[_da] | memory[_da + 1] << 8 | memory[_da + 2] << 16 | memory[_da + 3] << 24) & 0xffffffff,
+				advance += 4)) || :
+		else
+			disp64
+			step_a=${displacement}
+		fi
+		((step_a += seg_base)) || :
+		if ((step_op < 162)); then
+			read_mem "${step_width}" "${step_a}"
+			write_reg "${step_width}" 0 "${val}"
+		else
+			read_reg "${step_width}" 0
+			write_mem "${step_width}" "${step_a}" "${val}"
+		fi
+		;;
+	164 | 165 | 170 | 171 | 172 | 173) # 0xa4/a5 movs, 0xaa/ab stos, 0xac/ad lods
+		(((step_op & 1) == 0)) && step_width=1
+		((step_d = flag_df ? -step_width : step_width)) || :
+		while ((!rep_prefix || (addr_size_prefix ? (registers[RCX] & 0xffffffff) : registers[RCX]) != 0)); do
+			if ((step_op < 166)); then
+				# movs: DS:[RSI] (overridable by FS/GS) -> ES:[RDI]
+				((step_a = seg_base + (addr_size_prefix ? (registers[RSI] & 0xffffffff) : registers[RSI]),
+					step_b = addr_size_prefix ? (registers[RDI] & 0xffffffff) : registers[RDI])) || :
+				read_mem "${step_width}" "${step_a}"
+				write_mem "${step_width}" "${step_b}" "${val}"
+				((registers[RSI] += step_d, registers[RDI] += step_d)) || :
+			elif ((step_op < 172)); then
+				# stos: rAX -> ES:[RDI]
+				read_reg "${step_width}" 0
+				((step_b = addr_size_prefix ? (registers[RDI] & 0xffffffff) : registers[RDI])) || :
+				write_mem "${step_width}" "${step_b}" "${val}"
+				((registers[RDI] += step_d)) || :
+			else
+				# lods: DS:[RSI] (overridable by FS/GS) -> rAX
+				((step_a = seg_base + (addr_size_prefix ? (registers[RSI] & 0xffffffff) : registers[RSI]))) || :
+				read_mem "${step_width}" "${step_a}"
+				write_reg "${step_width}" 0 "${val}"
+				((registers[RSI] += step_d)) || :
+			fi
+			((rep_prefix)) || break
+			((registers[RCX]--)) || :
+			if ((addr_size_prefix)); then ((registers[RCX] &= 0xffffffff)) || :; fi
+		done
+		;;
+	166 | 167 | 174 | 175) # 0xa6/a7 cmps, 0xae/af scas
+		(((step_op & 1) == 0)) && step_width=1
+		((step_d = flag_df ? -step_width : step_width)) || :
+		while ((!rep_prefix || (addr_size_prefix ? (registers[RCX] & 0xffffffff) : registers[RCX]) != 0)); do
+			if ((step_op < 168)); then
+				# cmps: [RSI] - [RDI]
+				((step_a = seg_base + (addr_size_prefix ? (registers[RSI] & 0xffffffff) : registers[RSI]))) || :
+				read_mem "${step_width}" "${step_a}"
+				step_c=${val}
+				((registers[RSI] += step_d)) || :
+			else
+				# scas: rAX - [RDI]
+				read_reg "${step_width}" 0
+				step_c=${val}
+			fi
+			((step_b = addr_size_prefix ? (registers[RDI] & 0xffffffff) : registers[RDI])) || :
+			read_mem "${step_width}" "${step_b}"
+			((registers[RDI] += step_d)) || :
+			alu 7 "${step_width}" "${step_c}" "${val}"
+			((rep_prefix)) || break
+			((registers[RCX]--)) || :
+			if ((addr_size_prefix)); then ((registers[RCX] &= 0xffffffff)) || :; fi
+			if ((rep_prefix == 243)); then
+				((flag_zf)) || break # repe/repz: stop when ZF == 0
+			else
+				((flag_zf)) && break # repne/repnz: stop when ZF == 1
+			fi
+		done
+		;;
+	168 | 169) # 0xa8, 0xa9: test al/eAX, imm
+		((step_op == 168)) && step_width=1
+		disp_width "$((step_width == 8 ? 4 : step_width))"
+		read_reg "${step_width}" 0
+		alu 4 "${step_width}" "${val}" "$((displacement & (step_width == 8 ? -1 : (1 << (step_width * 8)) - 1)))"
+		;;
+	200) # 0xc8: enter imm16, imm8
+		disp16
+		((step_a = displacement & 0xffff)) || :
+		disp8
+		push64 "${registers[RBP]}"
+		((registers[RBP] = registers[RSP], registers[RSP] -= step_a)) || :
+		;;
+	201) # 0xc9: leave
+		((registers[RSP] = registers[RBP])) || :
+		pop64
+		((registers[RBP] = val)) || :
+		;;
+	204) # 0xcc: int3
+		die "Breakpoint (int3) at 0x%x" $((rip))
+		;;
+	215) # 0xd7: xlatb
+		((step_a = seg_base + (addr_size_prefix ? (registers[RBX] & 0xffffffff) : registers[RBX]) + (registers[RAX] & 0xff))) || :
+		read_mem 1 "${step_a}"
+		write_reg 1 0 "${val}"
+		;;
+	224 | 225 | 226) # 0xe0 loopne, 0xe1 loope, 0xe2 loop
+		disp8
+		if ((addr_size_prefix)); then
+			((step_a = (registers[RCX] - 1) & 0xffffffff, registers[RCX] = step_a)) || :
+		else
+			((step_a = --registers[RCX])) || :
+		fi
+		if ((step_a != 0 && (step_op == 226 || (step_op == 225 && flag_zf) || (step_op == 224 && !flag_zf)))); then
+			((advance += displacement)) || :
+		fi
+		;;
+	227) # 0xe3: jrcxz / jecxz
+		disp8
+		if (((addr_size_prefix ? (registers[RCX] & 0xffffffff) : registers[RCX]) == 0)); then
+			((advance += displacement)) || :
+		fi
+		;;
+	244) # 0xf4: hlt
+		die "HLT instruction at 0x%x" $((rip))
+		;;
+	245) ((flag_cf = !flag_cf)) || : ;; # 0xf5: cmc
+	248) flag_cf=0 ;;                   # 0xf8: clc
+	249) flag_cf=1 ;;                   # 0xf9: stc
+	252) flag_df=0 ;;                   # 0xfc: cld
+	253) flag_df=1 ;;                   # 0xfd: std
 	*)
-		unknown_insruction "$(printf '%02x' $((op)))" "unsupported instruction"
+		unknown_insruction "$(printf '%02x' $((step_op)))" "unsupported instruction"
 		;;
 	esac
 
@@ -1960,52 +3178,45 @@ function set_register() {
 }
 
 function set_memory() {
-	declare -ri width="$1" address="$2" value="$3"
-	declare -ria value_bytes=(
-		$((value & 0xff))
-		$(((value >> 8) & 0xff))
-		$(((value >> 16) & 0xff))
-		$(((value >> 24) & 0xff))
-		$(((value >> 32) & 0xff))
-		$(((value >> 40) & 0xff))
-		$(((value >> 48) & 0xff))
-		$(((value >> 56) & 0xff))
-	)
-	declare -i i
-	for ((i = 0; i < width; i++)); do
-		((memory[address + i]=value_bytes[i])) || :
-	done
-}
-
-function get_register() {
-	declare -ri width="$1" reg="$2"
-	case $((width)) in
-	1)
-		echo $((registers[reg] & 0xff))
-		;;
-	2)
-		echo $((registers[reg] & 0xffff))
-		;;
-	4)
-		echo $((registers[reg] & 0xffffffff))
-		;;
-	8)
-		echo $((registers[reg]))
+	case $1 in
+	1 | 2 | 4 | 8)
+		write_mem "$1" "$2" "$3"
 		;;
 	*)
-		die "Unsupported data width in get_register: ${width}"
+		declare -ri width="$1" address="$2" value="$3"
+		declare -i i
+		for ((i = 0; i < width; i++)); do
+			((memory[address + i] = (value >> (8 * i)) & 0xff)) || :
+		done
 		;;
 	esac
 }
 
+function get_register() {
+	case $1 in
+	8) echo $((registers[$2])) ;;
+	4) echo $((registers[$2] & 0xffffffff)) ;;
+	2) echo $((registers[$2] & 0xffff)) ;;
+	1) echo $((registers[$2] & 0xff)) ;;
+	*) die "Unsupported data width in get_register: $1" ;;
+	esac
+}
+
 function get_memory() {
-	declare -ri width="$1" address="$2"
-	declare -i value=0
-	declare -i i
-	for ((i = 0; i < width; i++)); do
-		((value += memory[address + i] << (8 * i))) || :
-	done
-	echo $((value))
+	case $1 in
+	1 | 2 | 4 | 8)
+		read_mem "$1" "$2"
+		echo $((val))
+		;;
+	*)
+		declare -ri width="$1" address="$2"
+		declare -i value=0 i
+		for ((i = 0; i < width; i++)); do
+			((value += memory[address + i] << (8 * i))) || :
+		done
+		echo $((value))
+		;;
+	esac
 }
 
 function get_width() {
@@ -2428,8 +3639,12 @@ function init() {
 	typeset -i i
 	for ((i = 0; i < 16; i++)); do
 		registers[$i]=0
+		xmm_lo[$i]=0
+		xmm_hi[$i]=0
 	done
 	registers[${RSP}]=$((0x10000))
+	GLOBAL_mxcsr=$((0x1f80))
+	seg_override=0 seg_base=0 addr_size_prefix=0 rep_prefix=0
 }
 
 # Prints "macho" or "elf" depending on the magic number of `binary_file`.
