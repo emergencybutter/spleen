@@ -137,12 +137,38 @@ declare -ri LC_DATA_IN_CODE=$((0x29))
 declare -ri LC_SOURCE_VERSION=$((0x2A))
 declare -ri LC_DYLIB_CODE_SIGN_DRS=$((0x2B))
 
+### ELF constants
+declare -ri ELFCLASS64=2
+declare -ri ELFDATA2LSB=1
+declare -ri ET_EXEC=2
+declare -ri ET_DYN=3
+declare -ri EM_X86_64=62
+declare -ri PT_LOAD=1
+declare -ri PT_DYNAMIC=2
+declare -ri PT_INTERP=3
+declare -ri PT_PHDR=6
+# Load address used for ET_DYN (static-pie) binaries.
+declare -ri ELF_DYN_BASE=$((0x555555554000))
+# Auxiliary vector entries
+declare -ri AT_NULL=0
+declare -ri AT_PHDR=3
+declare -ri AT_PHENT=4
+declare -ri AT_PHNUM=5
+declare -ri AT_PAGESZ=6
+declare -ri AT_BASE=7
+declare -ri AT_ENTRY=9
+declare -ri AT_UID=11
+declare -ri AT_EUID=12
+declare -ri AT_GID=13
+declare -ri AT_EGID=14
+declare -ri AT_RANDOM=25
+declare -ri AT_EXECFN=31
+
 ### Runtime global variables ###
 
 declare -i GLOBAL_text_vmaddr
 declare -i GLOBAL_entryoff
 declare -i GLOBAL_stacksize
-
 # Operating system ABI of the loaded binary: "macos" (default) or "linux".
 # Selects the system call table used by the `syscall` instruction. Binary
 # loaders are expected to set it (e.g. an ELF loader sets it to "linux").
@@ -451,6 +477,7 @@ function load_macho_file() {
 		die "Can't find magic number"
 	((mach_header_filetype == MH_EXECUTE)) ||
 		die "Unknown filetype"
+	GLOBAL_os_abi="macos"
 	declare -i i
 	for ((i = 0; i < mach_header_ncmds; i++)); do
 		consume_command
@@ -559,6 +586,263 @@ function consume_command() {
 		consume $((load_command_cmdsize - 8))
 		;;
 	esac
+}
+
+### ELF loader ###
+
+# Reads the whole binary in the `file_bytes` array (declared by the caller),
+# one integer per byte. A single hexdump call, no per byte subshell.
+function read_file_bytes() {
+	# hexdump does not print a trailing newline, so read returns 1 at EOF.
+	read -r -a file_bytes < <(hexdump -v -e '/1 "%u "' "${binary_file}") || :
+}
+
+# Usage: le_bytes <variable name> <offset> <size>
+# Stores the little endian unsigned integer of `size` bytes found at `offset`
+# in `file_bytes` in the variable named `variable name`.
+# uint64 values >= 2^63 wrap to negative values. YOLO.
+function le_bytes() {
+	declare -r le_var="$1"
+	declare -ri le_offset="$2" le_size="$3"
+	declare -i le_value=0 le_i
+	((le_offset >= 0 && le_offset + le_size <= ${#file_bytes[@]})) ||
+		die "ELF: read of %d bytes at offset 0x%x is out of file bounds" \
+			$((le_size)) $((le_offset))
+	for ((le_i = le_size - 1; le_i >= 0; le_i--)); do
+		((le_value = le_value << 8 | file_bytes[le_offset + le_i])) || :
+	done
+	printf -v "${le_var}" '%d' $((le_value))
+}
+
+# Copies `filesz` bytes of the segment in memory and zero fills up to
+# `memsz` (.bss).
+function load_elf_segment() {
+	declare -ri vaddr="$1" offset="$2" filesz="$3" memsz="$4"
+	declare -i i
+	((offset >= 0 && offset + filesz <= ${#file_bytes[@]})) ||
+		die "ELF: segment at offset 0x%x (size 0x%x) is out of file bounds" \
+			$((offset)) $((filesz))
+	((filesz <= memsz)) ||
+		die "ELF: segment at 0x%x has p_filesz > p_memsz" $((vaddr))
+	debug "ELF: loading segment vaddr: %x offset: %x filesz: %x memsz: %x" \
+		$((vaddr)) $((offset)) $((filesz)) $((memsz))
+	for ((i = 0; i < filesz; i++)); do
+		((memory[vaddr + i] = file_bytes[offset + i])) || :
+	done
+	for ((; i < memsz; i++)); do
+		((memory[vaddr + i] = 0)) || :
+	done
+}
+
+# Writes the NUL terminated string "$2" at address "$1" in memory.
+function put_string() {
+	declare -ri address="$1"
+	declare -r string="$2"
+	declare LC_ALL=C
+	declare -i i c
+	for ((i = 0; i < ${#string}; i++)); do
+		printf -v c '%d' "'${string:i:1}"
+		((memory[address + i] = c & 0xff)) || :
+	done
+	((memory[address + i] = 0)) || :
+}
+
+# Builds the initial process stack of the SysV x86_64 ABI below the current
+# RSP and points RSP at argc:
+#
+#   RSP -> argc
+#          argv[0] .. argv[argc - 1], NULL
+#          envp: NULL (empty environment)
+#          auxv: (type, value) pairs terminated by AT_NULL
+#          padding, AT_RANDOM bytes, argument strings.
+#
+# Usage: setup_linux_stack <entry> <phdr address> <phentsize> <phnum> [argv...]
+function setup_linux_stack() {
+	declare -ri entry="$1" phdr="$2" phentsize="$3" phnum="$4"
+	shift 4
+	declare -a args=("$@")
+	declare -ri argc=$#
+	declare -i sp=$((registers[RSP]))
+	declare -ia argv_ptrs=()
+	declare -i i
+
+	# Argument strings, last one first so that argv[0] ends up lowest.
+	for ((i = argc - 1; i >= 0; i--)); do
+		((sp -= ${#args[i]} + 1)) || :
+		put_string $((sp)) "${args[i]}"
+		argv_ptrs[i]=$((sp))
+	done
+	declare -ri execfn=$((argc > 0 ? argv_ptrs[0] : 0))
+
+	# 16 "random" bytes for AT_RANDOM (used by libc for stack canaries).
+	((sp = (sp - 16) & ~0xf)) || :
+	declare -ri random=$((sp))
+	for ((i = 0; i < 16; i++)); do
+		((memory[random + i] = RANDOM & 0xff)) || :
+	done
+
+	declare -ria auxv=(
+		$((AT_PHDR)) $((phdr))
+		$((AT_PHENT)) $((phentsize))
+		$((AT_PHNUM)) $((phnum))
+		$((AT_PAGESZ)) 4096
+		$((AT_BASE)) 0
+		$((AT_ENTRY)) $((entry))
+		$((AT_UID)) 0
+		$((AT_EUID)) 0
+		$((AT_GID)) 0
+		$((AT_EGID)) 0
+		$((AT_RANDOM)) $((random))
+		$((AT_EXECFN)) $((execfn))
+		$((AT_NULL)) 0
+	)
+	# argc + argv + argv NULL + envp NULL + auxv
+	declare -ri nwords=$((1 + argc + 1 + 1 + ${#auxv[@]}))
+	# RSP must be 16 byte aligned at process entry.
+	((sp = (sp - nwords * 8) & ~0xf)) || :
+	registers[RSP]=$((sp))
+
+	set_memory 8 $((sp)) $((argc))
+	((sp += 8)) || :
+	for ((i = 0; i < argc; i++)); do
+		set_memory 8 $((sp)) $((argv_ptrs[i]))
+		((sp += 8)) || :
+	done
+	set_memory 8 $((sp)) 0 # argv NULL
+	((sp += 8)) || :
+	set_memory 8 $((sp)) 0 # envp NULL
+	((sp += 8)) || :
+	for ((i = 0; i < ${#auxv[@]}; i++)); do
+		set_memory 8 $((sp)) $((auxv[i]))
+		((sp += 8)) || :
+	done
+	debug "ELF: stack set up, RSP: %x argc: %d" $((registers[RSP])) $((argc))
+}
+
+# Loads a static Linux ELF64 x86_64 executable from `binary_file`.
+# Arguments are the guest argv (argv[0] included).
+function load_elf_file() {
+	declare -a file_bytes
+	read_file_bytes
+	declare -ri file_size=${#file_bytes[@]}
+
+	#typedef struct {
+	#	unsigned char e_ident[16]; /* 0: magic, class, data, version... */
+	#	uint16_t e_type;           /* 16 */
+	#	uint16_t e_machine;        /* 18 */
+	#	uint32_t e_version;        /* 20 */
+	#	uint64_t e_entry;          /* 24 */
+	#	uint64_t e_phoff;          /* 32 */
+	#	uint64_t e_shoff;          /* 40 */
+	#	uint32_t e_flags;          /* 48 */
+	#	uint16_t e_ehsize;         /* 52 */
+	#	uint16_t e_phentsize;      /* 54 */
+	#	uint16_t e_phnum;          /* 56 */
+	#	...
+	#} Elf64_Ehdr;
+	((file_size >= 64)) || die "ELF: file too small"
+	((file_bytes[0] == 0x7f && file_bytes[1] == 0x45 &&
+		file_bytes[2] == 0x4c && file_bytes[3] == 0x46)) ||
+		die "ELF: can't find magic number"
+	((file_bytes[4] == ELFCLASS64)) ||
+		die "ELF: only 64 bit (ELFCLASS64) binaries are supported"
+	((file_bytes[5] == ELFDATA2LSB)) ||
+		die "ELF: only little endian binaries are supported"
+
+	declare -i e_type e_machine e_entry e_phoff e_phentsize e_phnum
+	le_bytes e_type 16 2
+	le_bytes e_machine 18 2
+	le_bytes e_entry 24 8
+	le_bytes e_phoff 32 8
+	le_bytes e_phentsize 54 2
+	le_bytes e_phnum 56 2
+
+	((e_machine == EM_X86_64)) ||
+		die "ELF: unsupported machine %d, only x86_64 (%d) is supported" \
+			$((e_machine)) $((EM_X86_64))
+
+	declare -i load_base=0
+	case $((e_type)) in
+	$((ET_EXEC))) ;;
+	$((ET_DYN)))
+		# static-pie: load at a fixed base.
+		load_base=$((ELF_DYN_BASE))
+		;;
+	*)
+		die "ELF: unsupported type %d, not an executable" $((e_type))
+		;;
+	esac
+
+	((e_phnum > 0)) || die "ELF: no program headers"
+	((e_phentsize >= 56)) || die "ELF: invalid e_phentsize %d" $((e_phentsize))
+	((e_phoff + e_phnum * e_phentsize <= file_size)) ||
+		die "ELF: program headers are out of file bounds"
+
+	#typedef struct {
+	#	uint32_t p_type;   /* 0 */
+	#	uint32_t p_flags;  /* 4 */
+	#	uint64_t p_offset; /* 8 */
+	#	uint64_t p_vaddr;  /* 16 */
+	#	uint64_t p_paddr;  /* 24 */
+	#	uint64_t p_filesz; /* 32 */
+	#	uint64_t p_memsz;  /* 40 */
+	#	uint64_t p_align;  /* 48 */
+	#} Elf64_Phdr;
+	declare -i i ph p_type p_flags p_offset p_vaddr p_filesz p_memsz
+	# Refuse dynamically linked binaries before loading anything.
+	for ((i = 0; i < e_phnum; i++)); do
+		((ph = e_phoff + i * e_phentsize)) || :
+		le_bytes p_type $((ph)) 4
+		((p_type != PT_INTERP)) ||
+			die "ELF: dynamically linked binaries (PT_INTERP) are not supported, link with -static"
+	done
+
+	declare -i phdr_addr=0 text_vmaddr=-1 image_end=0
+	for ((i = 0; i < e_phnum; i++)); do
+		((ph = e_phoff + i * e_phentsize)) || :
+		le_bytes p_type $((ph)) 4
+		le_bytes p_flags $((ph + 4)) 4
+		le_bytes p_offset $((ph + 8)) 8
+		le_bytes p_vaddr $((ph + 16)) 8
+		le_bytes p_filesz $((ph + 32)) 8
+		le_bytes p_memsz $((ph + 40)) 8
+		debug "ELF: program header type: %x flags: %x offset: %x vaddr: %x filesz: %x memsz: %x" \
+			$((p_type)) $((p_flags)) $((p_offset)) $((p_vaddr)) $((p_filesz)) $((p_memsz))
+		case $((p_type)) in
+		$((PT_LOAD)))
+			load_elf_segment $((load_base + p_vaddr)) $((p_offset)) $((p_filesz)) $((p_memsz))
+			# The program break starts after the highest loaded segment.
+			if ((load_base + p_vaddr + p_memsz > image_end)); then
+				((image_end = load_base + p_vaddr + p_memsz)) || :
+			fi
+			# PF_X: the first executable segment plays the role of __TEXT.
+			if ((p_flags & 0x1 && text_vmaddr < 0)); then
+				((text_vmaddr = load_base + p_vaddr)) || :
+			fi
+			# Program headers mapped by this segment (for AT_PHDR).
+			if ((phdr_addr == 0 && e_phoff >= p_offset &&
+				e_phoff < p_offset + p_filesz)); then
+				((phdr_addr = load_base + p_vaddr + e_phoff - p_offset)) || :
+			fi
+			;;
+		$((PT_PHDR)))
+			((phdr_addr = load_base + p_vaddr)) || :
+			;;
+		esac
+	done
+
+	((text_vmaddr >= 0)) || die "ELF: no executable PT_LOAD segment"
+
+	GLOBAL_os_abi="linux"
+	# Page aligned end of the loaded image.
+	((GLOBAL_linux_brk_start = (image_end + 0xfff) & ~0xfff)) || :
+	# run() starts at GLOBAL_text_vmaddr + GLOBAL_entryoff.
+	((GLOBAL_text_vmaddr = text_vmaddr)) || :
+	((GLOBAL_entryoff = load_base + e_entry - text_vmaddr)) || :
+	debug "ELF: entry point: %x" $((load_base + e_entry))
+
+	setup_linux_stack $((load_base + e_entry)) $((phdr_addr)) \
+		$((e_phentsize)) $((e_phnum)) "$@"
 }
 
 function inst_push() {
@@ -1365,15 +1649,46 @@ function init() {
 	registers[${RSP}]=$((0x10000))
 }
 
+# Prints "macho" or "elf" depending on the magic number of `binary_file`.
+function binary_format() {
+	[[ -r "${binary_file}" ]] || die "Can't read binary: ${binary_file}"
+	declare -r magic=$(hexdump -n 4 -v -e '4/1 "%02x"' "${binary_file}")
+	case "${magic}" in
+	7f454c46)
+		echo elf
+		;;
+	cffaedfe)
+		echo macho
+		;;
+	*)
+		die "Unknown binary format (magic: ${magic})"
+		;;
+	esac
+}
+
 function main() {
 	declare -r binary_file="$1"
-	# The binary reaches the loader through a pipe that replaces stdin. Keep
-	# the original stdin on fd 3 and give it back to the emulated program.
-	{
-		dump_file | (
+	declare format
+	# Separate assignment so that set -e catches a failing binary_format.
+	format=$(binary_format)
+	# The macOS loader reads the binary through a pipe that replaces stdin.
+	# Keep the original stdin on fd 3 and give it back to the emulated program.
+	case "${format}" in
+	macho)
+		{
+			dump_file | (
+				init
+				load_macho_file
+				run 0<&3 3<&-
+			)
+		} 3<&0
+		;;
+	elf)
+		(
 			init
-			load_macho_file
-			run 0<&3 3<&-
+			load_elf_file "$@"
+			run
 		)
-	} 3<&0
+		;;
+	esac
 }
