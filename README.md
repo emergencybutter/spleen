@@ -40,12 +40,12 @@ The format is detected from the magic number of the binary.
 
 * **Mach-O** (`0xfeedfacf`): 64 bit `MH_EXECUTE` OSX executables, entry point from `LC_MAIN`. Only `__TEXT` is loaded.
 * **ELF** (`0x7f 'E' 'L' 'F'`): `ELFCLASS64`, little endian, `EM_X86_64` executables.
-  * `ET_EXEC` binaries are loaded at their link addresses; `ET_DYN` (static-pie) binaries at the fixed base `0x555555554000`.
-    Note that spleen does not apply relocations, a static-pie binary has to relocate itself.
-  * Every `PT_LOAD` segment is mapped at `p_vaddr` (`p_filesz` bytes copied from the file, zero filled up to `p_memsz`).
-  * Dynamically linked binaries (with a `PT_INTERP` program header) are refused: link with `-static` and without libc.
-  * The initial stack follows the SysV ABI: `argc`, `argv` (the binary path and extra arguments given to `spleen.bash`),
-    an empty `envp` and a minimal auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`...).
+  * `ET_EXEC` binaries are loaded at their link addresses; `ET_DYN` (PIE / static-pie) binaries at the fixed base `0x555555554000`.
+  * Every `PT_LOAD` segment is mapped at `load_base + p_vaddr` (`p_filesz` bytes copied from the file, zero filled up to `p_memsz`).
+  * For binaries without `PT_INTERP` (such as `-static-pie` / `ET_DYN` images), the loader parses `PT_DYNAMIC` and applies `DT_RELR`, `DT_RELA` and `DT_JMPREL` relocations (`R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_PC32`/`PLT32`, `R_X86_64_32`/`32S`, `R_X86_64_COPY`).
+  * Dynamically linked binaries with a `PT_INTERP` program header are supported: the main executable is mapped at `0x555555554000` (if `ET_DYN`), the dynamic linker (e.g. `/lib64/ld-linux-x86-64.so.2`) is mapped at `0x7ffff7fc0000`, `AT_BASE` is set to the interpreter base while `AT_ENTRY`/`AT_PHDR` describe the main executable, and execution starts at the interpreter entry point so `_dl_start` relocates and links shared libraries at runtime.
+  * The initial stack follows the SysV ABI (at `0x7fffffffe000`): `argc`, `argv` (the binary path and extra arguments given to `spleen.bash`),
+    an empty `envp` and an auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_UID`/`AT_EUID`, `AT_GID`/`AT_EGID`, `AT_RANDOM`, `AT_EXECFN`).
 
 The loader sets `GLOBAL_os_abi` to `macos` or `linux` so that the syscall emulation knows which kernel ABI to emulate.
 `examples/hi-linux.S` is a static, libc free Linux "Hello World!" (`examples-bin/hi-linux`).
@@ -104,7 +104,7 @@ The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `li
 
 * macOS: `write` (0x2000004) and `exit` (0x2000001).
 * Linux x86_64 (number in `rax`, arguments in `rdi rsi rdx r10 r8 r9`, result or negative errno in `rax`, `rcx`/`r11` clobbered):
-  `read` (fd 0 only), `write`/`writev` (fd 1 and 2), `close`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous only, bump allocator), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getpid`, `gettid`, `getuid`, `getgid`, `geteuid`, `getegid`, `uname`, `arch_prctl` (FS/GS base is only stored), `set_tid_address`, `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
+  `read` (stdin on fd 0 and open read-only host files on fd >= 3), `pread64`, `write`/`writev` (fd 1 and 2), `open`/`openat` (read-only host files), `close`, `stat`/`fstat`/`lstat`/`newfstatat`, `lseek`, `access`/`faccessat`/`faccessat2`, `fcntl`, `dup`, `getcwd`, `readlink`/`readlinkat`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous and read-only file-backed mappings), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getrlimit`/`prlimit64`, `getpid`, `gettid`, `getppid`, `getpgrp`, `getuid`, `getgid`, `geteuid`, `getegid`, `getresuid`, `getresgid`, `uname`, `arch_prctl` (FS/GS base is only stored), `futex`, `set_tid_address`, `set_robust_list`, `getrandom`, `rseq` (`-ENOSYS`), `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
   Unimplemented Linux syscalls return `-ENOSYS` (visible with `enable_debug_messages=true`), since libc start-up code probes optional syscalls.
 
 ## Technical notes

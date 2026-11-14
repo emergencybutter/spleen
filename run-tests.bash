@@ -148,12 +148,119 @@ function test_linux_memory() {
 	((map1 > 0 && (map1 & 0xfff) == 0)) || die "bad mmap address %x" $((map1))
 	linux_syscall 9 0 100 3 $((0x22)) -1 0
 	check_eq "$(rax)" $((map1 + 0x1000)) "second mmap"
-	linux_syscall 9 0 100 3 2 3 0
-	check_eq "$(rax)" -19 "file mmap unsupported"
+	linux_syscall 9 0 100 3 2 1 0
+	check_eq "$(rax)" -19 "file mmap on non-mmapable fd"
+	linux_syscall 9 0 100 3 2 99 0
+	check_eq "$(rax)" -9 "file mmap on closed fd"
 	linux_syscall 9 0 0 3 $((0x22)) -1 0
 	check_eq "$(rax)" -22 "zero length mmap"
 	linux_syscall 11 $((map1)) 100
 	check_eq "$(rax)" 0 "munmap"
+}
+
+function test_linux_file_syscalls() {
+	GLOBAL_os_abi=linux
+	declare -ri path_buf=$((0xc000)) data_buf=$((0xc400)) stat_buf=$((0xc800))
+	printf '0123456789abcdefHELLO_MMAP' >"${TEST_tmpdir}/sample"
+	ln -s "${TEST_tmpdir}/sample" "${TEST_tmpdir}/sample_link"
+
+	# Write-mode openat is refused; missing file returns -ENOENT.
+	put_string $((path_buf)) "${TEST_tmpdir}/sample"
+	linux_syscall 257 -100 $((path_buf)) 1 0
+	check_eq "$(rax)" -13 "openat O_WRONLY refused"
+	put_string $((path_buf)) "${TEST_tmpdir}/does_not_exist"
+	linux_syscall 257 $((0xffffff9c)) $((path_buf)) 0 0
+	check_eq "$(rax)" -2 "openat missing file (32-bit AT_FDCWD)"
+
+	# Read-only openat with 32-bit zero-extended AT_FDCWD (0xffffff9c).
+	put_string $((path_buf)) "${TEST_tmpdir}/sample"
+	linux_syscall 257 $((0xffffff9c)) $((path_buf)) 0 0
+	declare -ri fd=$(rax)
+	((fd >= 3)) || die "openat returned %d" $((fd))
+
+	# read, pread64 (must not advance fd_pos), lseek.
+	linux_syscall 0 $((fd)) $((data_buf)) 4
+	check_eq "$(rax)" 4 "read 4 bytes from file"
+	check_eq "$(get_memory 4 $((data_buf)))" $((0x33323130)) "read '0123'"
+
+	linux_syscall 17 $((fd)) $((data_buf + 16)) 5 16
+	check_eq "$(rax)" 5 "pread64 5 bytes at offset 16"
+	check_eq "$(get_memory 4 $((data_buf + 16)))" $((0x4c4c4548)) "pread64 'HELL'"
+
+	linux_syscall 0 $((fd)) $((data_buf)) 4
+	check_eq "$(rax)" 4 "read continues from offset 4 after pread64"
+	check_eq "$(get_memory 4 $((data_buf)))" $((0x37363534)) "read '4567'"
+
+	linux_syscall 8 $((fd)) -4 2 # SEEK_END - 4 -> "MMAP"
+	check_eq "$(rax)" 22 "lseek SEEK_END - 4"
+	linux_syscall 0 $((fd)) $((data_buf)) 10
+	check_eq "$(rax)" 4 "read until EOF"
+	check_eq "$(get_memory 4 $((data_buf)))" $((0x50414d4d)) "read 'MMAP'"
+
+	# fstat on regular file and stdout, plus newfstatat AT_EMPTY_PATH.
+	linux_syscall 5 $((fd)) $((stat_buf))
+	check_eq "$(rax)" 0 "fstat on open file"
+	check_eq "$(get_memory 8 $((stat_buf + 48)))" 26 "fstat st_size"
+	((($(get_memory 4 $((stat_buf + 24))) & 0xf000) == 0x8000)) ||
+		die "fstat st_mode is not S_IFREG"
+
+	linux_syscall 5 1 $((stat_buf))
+	check_eq "$(rax)" 0 "fstat on stdout"
+	((($(get_memory 4 $((stat_buf + 24))) & 0xf000) == 0x2000)) ||
+		die "stdout st_mode is not S_IFCHR"
+
+	put_string $((path_buf)) ""
+	linux_syscall 262 $((fd)) $((path_buf)) $((stat_buf)) $((0x1000))
+	check_eq "$(rax)" 0 "newfstatat AT_EMPTY_PATH"
+	check_eq "$(get_memory 8 $((stat_buf + 48)))" 26 "newfstatat st_size"
+
+	# File-backed mmap (PROT_READ, MAP_PRIVATE) + MAP_FIXED sub-mapping.
+	linux_syscall 9 0 8192 1 2 $((fd)) 0
+	declare -ri fmap=$(rax)
+	((fmap > 0 && (fmap & 0xfff) == 0)) || die "bad file mmap %x" $((fmap))
+	check_eq "$(get_memory 4 $((fmap + 16)))" $((0x4c4c4548)) "mmap file bytes"
+	check_eq "$(get_memory 1 $((fmap + 100)))" 0 "mmap trailing zero byte"
+	linux_syscall 9 $((fmap + 0x1000)) 4096 5 $((0x12)) $((fd)) 4096
+	check_eq "$(rax)" $((fmap + 0x1000)) "mmap MAP_FIXED fast path"
+
+	# access, fcntl, readlink, getcwd, prlimit64, getresuid, getrandom, close.
+	put_string $((path_buf)) "${TEST_tmpdir}/sample"
+	linux_syscall 21 $((path_buf)) 4 # R_OK
+	check_eq "$(rax)" 0 "access R_OK"
+	linux_syscall 21 $((path_buf)) 2 # W_OK
+	check_eq "$(rax)" -13 "access W_OK refused"
+
+	linux_syscall 72 $((fd)) 1030 10 # F_DUPFD_CLOEXEC >= 10
+	declare -ri dupfd=$(rax)
+	((dupfd >= 10)) || die "F_DUPFD_CLOEXEC returned %d" $((dupfd))
+	linux_syscall 3 $((dupfd))
+	check_eq "$(rax)" 0 "close dupfd"
+
+	put_string $((path_buf)) "${TEST_tmpdir}/sample_link"
+	linux_syscall 89 $((path_buf)) $((data_buf)) 256
+	declare -ri link_len=$((${#TEST_tmpdir} + 7))
+	check_eq "$(rax)" $((link_len)) "readlink length"
+
+	linux_syscall 79 $((data_buf)) 4096
+	check_eq "$(rax)" $((${#PWD} + 1)) "getcwd length"
+
+	linux_syscall 302 0 3 0 $((stat_buf)) # prlimit64 RLIMIT_STACK
+	check_eq "$(rax)" 0 "prlimit64"
+	check_eq "$(get_memory 8 $((stat_buf)))" $((8 * 1024 * 1024)) "RLIMIT_STACK cur"
+	check_eq "$(get_memory 8 $((stat_buf + 8)))" -1 "RLIMIT_STACK max"
+
+	linux_syscall 118 $((stat_buf)) $((stat_buf + 4)) $((stat_buf + 8))
+	check_eq "$(rax)" 0 "getresuid"
+	check_eq "$(get_memory 4 $((stat_buf)))" "${UID}" "getresuid ruid"
+	check_eq "$(get_memory 4 $((stat_buf + 4)))" "${EUID}" "getresuid euid"
+
+	linux_syscall 318 $((data_buf)) 16 0
+	check_eq "$(rax)" 16 "getrandom"
+
+	linux_syscall 3 $((fd))
+	check_eq "$(rax)" 0 "close file fd"
+	linux_syscall 0 $((fd)) $((data_buf)) 4
+	check_eq "$(rax)" -9 "read after close fails with EBADF"
 }
 
 function test_linux_misc() {
@@ -287,16 +394,197 @@ function test_run_elf_until_syscall() {
 		die "unexpected registers at first syscall: ${result}"
 }
 
-# A binary with a PT_INTERP program header must be refused.
+# A binary with an invalid/unreadable PT_INTERP interpreter must be refused.
 function test_refuse_dynamic_elf() {
 	declare -r binary_file=$(mktemp)
 	cp examples-bin/hi-linux "${binary_file}"
-	# Turn the first program header (at e_phoff = 64) into PT_INTERP.
+	# Turn the first program header (at e_phoff = 64) into PT_INTERP; its bytes
+	# start with 0x7f 'E' 'L' 'F', which is not an existing interpreter path.
 	printf '\003' | dd of="${binary_file}" bs=1 seek=64 conv=notrunc 2>/dev/null
 	declare -r output=$( (init && load_elf_file "${binary_file}") 2>&1 || :)
 	rm -f "${binary_file}"
 	[[ "${output}" == *PT_INTERP* ]] ||
-		die "dynamic ELF was not refused: ${output}"
+		die "broken PT_INTERP ELF was not refused: ${output}"
+}
+
+# Tests apply_elf_relocations on DT_RELR (including bit 62 of a bitmap entry),
+# DT_RELA (R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_PC32),
+# and DT_JMPREL (R_X86_64_JUMP_SLOT), plus end-to-end execution of compiled
+# nostdlib static-PIE / ET_DYN binaries when a Linux x86_64 C compiler exists.
+function test_elf_relocations() {
+	(
+		init
+		declare -ri base=$((0x555555554000))
+		declare -ri dyn=$((base + 0x1000))
+		declare -ri symtab=$((base + 0x1200))
+		declare -ri rela=$((base + 0x1300))
+		declare -ri jmprel=$((base + 0x1400))
+		declare -ri relr=$((base + 0x1500))
+		declare -ri data=$((base + 0x2000))
+
+		# Populate DT_RELR:
+		#   entry 0: even offset 0x2000 -> relocates data+0, where becomes data+8
+		#   entry 1: bitmap with bit 0 and bit 62 set ((1<<63) | 3)
+		#            -> relocates data+8 and data+8+62*8 = data+0x1f8,
+		#               where becomes data+8+63*8 = data+0x200
+		#   entry 2: bitmap with bit 0 set (3) -> relocates data+0x200
+		elf_mem_write64 $((data + 0)) $((0x111))
+		elf_mem_write64 $((data + 8)) $((0x222))
+		elf_mem_write64 $((data + 0x1f8)) $((0x333))
+		elf_mem_write64 $((data + 0x200)) $((0x444))
+		elf_mem_write64 $((relr + 0)) $((0x2000))
+		elf_mem_write64 $((relr + 8)) $(((1 << 63) | 3))
+		elf_mem_write64 $((relr + 16)) 3
+
+		# Populate symbol #1 in DT_SYMTAB (st_shndx = 1 at +6, st_value = 0x3456 at +8).
+		set_memory 2 $((symtab + 24 + 6)) 1
+		elf_mem_write64 $((symtab + 24 + 8)) $((0x3456))
+
+		# DT_RELA entries:
+		#   0: R_X86_64_RELATIVE (8) at 0x2020, addend 0x2500
+		#   1: R_X86_64_64 (1) sym 1 at 0x2028, addend 0x10
+		#   2: R_X86_64_GLOB_DAT (6) sym 1 at 0x2030, addend 0
+		#   3: R_X86_64_PC32 (2) sym 1 at 0x2038, addend -4
+		elf_mem_write64 $((rela + 0)) $((0x2020))
+		elf_mem_write64 $((rela + 8)) $((R_X86_64_RELATIVE))
+		elf_mem_write64 $((rela + 16)) $((0x2500))
+
+		elf_mem_write64 $((rela + 24)) $((0x2028))
+		elf_mem_write64 $((rela + 32)) $(((1 << 32) | R_X86_64_64))
+		elf_mem_write64 $((rela + 40)) $((0x10))
+
+		elf_mem_write64 $((rela + 48)) $((0x2030))
+		elf_mem_write64 $((rela + 56)) $(((1 << 32) | R_X86_64_GLOB_DAT))
+		elf_mem_write64 $((rela + 64)) 0
+
+		elf_mem_write64 $((rela + 72)) $((0x2038))
+		elf_mem_write64 $((rela + 80)) $(((1 << 32) | R_X86_64_PC32))
+		elf_mem_write64 $((rela + 88)) -4
+
+		# DT_JMPREL entry: R_X86_64_JUMP_SLOT (7) sym 1 at 0x2040.
+		elf_mem_write64 $((jmprel + 0)) $((0x2040))
+		elf_mem_write64 $((jmprel + 8)) $(((1 << 32) | R_X86_64_JUMP_SLOT))
+		elf_mem_write64 $((jmprel + 16)) 0
+
+		# Build PT_DYNAMIC with relative vaddrs (ET_DYN).
+		declare -ia dtags=(
+			$((DT_SYMTAB)) $((0x1200))
+			$((DT_SYMENT)) 24
+			$((DT_RELR)) $((0x1500))
+			$((DT_RELRSZ)) 24
+			$((DT_RELRENT)) 8
+			$((DT_RELA)) $((0x1300))
+			$((DT_RELASZ)) 96
+			$((DT_RELAENT)) 24
+			$((DT_PLTREL)) $((DT_RELA))
+			$((DT_JMPREL)) $((0x1400))
+			$((DT_PLTRELSZ)) 24
+			$((DT_NULL)) 0
+		)
+		declare -i di
+		for ((di = 0; di < ${#dtags[@]}; di++)); do
+			elf_mem_write64 $((dyn + di * 8)) $((dtags[di]))
+		done
+
+		apply_elf_relocations $((base)) $((ET_DYN)) $((dyn)) $((${#dtags[@]} * 8))
+
+		check_eq "$(get_memory 8 $((data + 0)))" $((base + 0x111)) "DT_RELR even entry"
+		check_eq "$(get_memory 8 $((data + 8)))" $((base + 0x222)) "DT_RELR bitmap bit 0"
+		check_eq "$(get_memory 8 $((data + 0x1f8)))" $((base + 0x333)) "DT_RELR bitmap bit 62"
+		check_eq "$(get_memory 8 $((data + 0x200)))" $((base + 0x444)) "DT_RELR next bitmap word"
+		check_eq "$(get_memory 8 $((data + 0x20)))" $((base + 0x2500)) "R_X86_64_RELATIVE"
+		check_eq "$(get_memory 8 $((data + 0x28)))" $((base + 0x3466)) "R_X86_64_64"
+		check_eq "$(get_memory 8 $((data + 0x30)))" $((base + 0x3456)) "R_X86_64_GLOB_DAT"
+		check_eq "$(get_memory 4 $((data + 0x38)))" $(((0x3456 - 0x2038 - 4) & 0xffffffff)) "R_X86_64_PC32"
+		check_eq "$(get_memory 8 $((data + 0x40)))" $((base + 0x3456)) "R_X86_64_JUMP_SLOT"
+	)
+
+	# End-to-end execution of real compiler-generated static-PIE (RELA + RELR)
+	# and symbol-relocated ET_DYN binaries when running on Linux x86_64 with cc.
+	if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] && command -v cc >/dev/null 2>&1; then
+		cat >"${TEST_tmpdir}/reloc_test.c" <<-'EOF'
+			const char msg[] = "reloc-ok\n";
+			const char *ptrs[3] = { msg, msg + 6, msg };
+			__attribute__((noinline)) long msg_len(void) { return 9; }
+			void _start(void) {
+				long len = msg_len();
+				register long rax __asm__("rax") = 1;
+				register long rdi __asm__("rdi") = 1;
+				register const char *rsi __asm__("rsi") = ptrs[0];
+				register long rdx __asm__("rdx") = len;
+				__asm__ volatile("syscall"
+					: "+r"(rax) : "r"(rdi), "r"(rsi), "r"(rdx) : "rcx", "r11", "memory");
+				rax = 60;
+				rdi = (ptrs[1][0] == 'o') ? 0 : 1;
+				__asm__ volatile("syscall" : "+r"(rax) : "r"(rdi) : "rcx", "r11");
+			}
+		EOF
+		cc -O1 -fno-stack-protector -fPIE -static-pie -nostdlib -Wl,--build-id=none \
+			-o "${TEST_tmpdir}/pie_rela" "${TEST_tmpdir}/reloc_test.c"
+		check_eq "$(main "${TEST_tmpdir}/pie_rela")" "reloc-ok" "run static-pie RELA binary"
+
+		if cc -O1 -fno-stack-protector -fPIE -static-pie -nostdlib \
+			-Wl,-z,pack-relative-relocs -Wl,--build-id=none \
+			-o "${TEST_tmpdir}/pie_relr" "${TEST_tmpdir}/reloc_test.c" 2>/dev/null; then
+			check_eq "$(main "${TEST_tmpdir}/pie_relr")" "reloc-ok" "run static-pie RELR binary"
+		fi
+
+		cc -O1 -fno-stack-protector -fPIC -shared -nostdlib -e _start -Wl,--build-id=none \
+			-o "${TEST_tmpdir}/et_dyn_sym" "${TEST_tmpdir}/reloc_test.c"
+		check_eq "$(main "${TEST_tmpdir}/et_dyn_sym")" "reloc-ok" \
+			"run ET_DYN with R_X86_64_64/GLOB_DAT/JUMP_SLOT"
+	fi
+}
+
+# Verifies PT_INTERP dynamic ELF loading (/bin/bash + ld-linux-x86-64.so.2):
+# both images mapped at their respective bases, RSP raised, AT_BASE/AT_ENTRY
+# set properly in auxv, and execution starting at the interpreter entry point.
+function test_load_dynamic_elf() {
+	if [[ ! -r /bin/bash || ! -r /lib64/ld-linux-x86-64.so.2 ]]; then
+		return
+	fi
+	declare -r magic=$(hexdump -n 5 -v -e '5/1 "%02x"' /bin/bash)
+	[[ "${magic}" == "7f454c4602" ]] || return
+
+	(
+		declare -r binary_file=/bin/bash
+		init
+		load_elf_file "${binary_file}" --help
+
+		# Both main executable and PT_INTERP dynamic linker are mapped.
+		check_eq "$(get_memory 4 $((ELF_DYN_BASE)))" $((0x464c457f)) "/bin/bash ELF magic at ELF_DYN_BASE"
+		check_eq "$(get_memory 4 $((ELF_INTERP_BASE)))" $((0x464c457f)) "ld-linux ELF magic at ELF_INTERP_BASE"
+
+		declare -ri bash_e_entry=$(get_memory 8 $((ELF_DYN_BASE + 24)))
+		declare -ri ld_e_entry=$(get_memory 8 $((ELF_INTERP_BASE + 24)))
+		declare -ri actual_start=$((GLOBAL_text_vmaddr + GLOBAL_entryoff))
+		check_eq "${actual_start}" $((ELF_INTERP_BASE + ld_e_entry)) \
+			"execution starts at PT_INTERP entry point"
+
+		# Stack should be near LINUX_INITIAL_RSP and contain AT_BASE and AT_ENTRY.
+		declare -ri sp=$((registers[RSP]))
+		((sp > 0x7fffffff0000 && sp % 16 == 0)) ||
+			die "unexpected Linux RSP: 0x%x" $((sp))
+		check_eq "$(get_memory 8 $((sp)))" 2 "argc for /bin/bash --help"
+
+		# Walk past argc, argv[0..1], NULL, envp NULL to inspect auxv.
+		declare -i auxp=$((sp + 8 * (1 + 2 + 1 + 1)))
+		declare -i at_type at_val got_base=-1 got_entry=-1 got_phdr=-1
+		while true; do
+			at_type=$(get_memory 8 $((auxp)))
+			at_val=$(get_memory 8 $((auxp + 8)))
+			((at_type == AT_NULL)) && break
+			case $((at_type)) in
+			$((AT_BASE))) got_base=$((at_val)) ;;
+			$((AT_ENTRY))) got_entry=$((at_val)) ;;
+			$((AT_PHDR))) got_phdr=$((at_val)) ;;
+			esac
+			((auxp += 16)) || :
+		done
+		check_eq "${got_base}" $((ELF_INTERP_BASE)) "auxv AT_BASE is ELF_INTERP_BASE"
+		check_eq "${got_entry}" $((ELF_DYN_BASE + bash_e_entry)) "auxv AT_ENTRY is main entry"
+		check_eq "${got_phdr}" $((ELF_DYN_BASE + 64)) "auxv AT_PHDR is main phdr"
+	)
 }
 
 function test_binary_format() {
@@ -784,6 +1072,7 @@ function run_tests() {
 	test_linux_write
 	test_linux_read
 	test_linux_memory
+	test_linux_file_syscalls
 	test_linux_misc
 	test_linux_syscall_instruction
 	test_macos_syscall_dispatch
@@ -791,6 +1080,8 @@ function run_tests() {
 	(test_load_elf)
 	(test_run_elf_until_syscall)
 	test_refuse_dynamic_elf
+	test_elf_relocations
+	test_load_dynamic_elf
 	test_alu
 	test_test_inc_dec_neg_not
 	test_mul_div

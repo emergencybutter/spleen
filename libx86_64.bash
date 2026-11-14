@@ -147,8 +147,36 @@ declare -ri PT_LOAD=1
 declare -ri PT_DYNAMIC=2
 declare -ri PT_INTERP=3
 declare -ri PT_PHDR=6
-# Load address used for ET_DYN (static-pie) binaries.
+# Load address used for ET_DYN (PIE / static-pie) binaries and PT_INTERP loader.
 declare -ri ELF_DYN_BASE=$((0x555555554000))
+declare -ri ELF_INTERP_BASE=$((0x7ffff7fc0000))
+declare -ri LINUX_INITIAL_RSP=$((0x7fffffffe000))
+# Dynamic section tags
+declare -ri DT_NULL=0
+declare -ri DT_PLTRELSZ=2
+declare -ri DT_STRTAB=5
+declare -ri DT_SYMTAB=6
+declare -ri DT_RELA=7
+declare -ri DT_RELASZ=8
+declare -ri DT_RELAENT=9
+declare -ri DT_SYMENT=11
+declare -ri DT_PLTREL=20
+declare -ri DT_JMPREL=23
+declare -ri DT_RELRSZ=35
+declare -ri DT_RELR=36
+declare -ri DT_RELRENT=37
+# x86_64 ELF relocation types
+declare -ri R_X86_64_NONE=0
+declare -ri R_X86_64_64=1
+declare -ri R_X86_64_PC32=2
+declare -ri R_X86_64_PLT32=4
+declare -ri R_X86_64_COPY=5
+declare -ri R_X86_64_GLOB_DAT=6
+declare -ri R_X86_64_JUMP_SLOT=7
+declare -ri R_X86_64_RELATIVE=8
+declare -ri R_X86_64_32=10
+declare -ri R_X86_64_32S=11
+declare -ri R_X86_64_IRELATIVE=37
 # Auxiliary vector entries
 declare -ri AT_NULL=0
 declare -ri AT_PHDR=3
@@ -179,12 +207,20 @@ declare GLOBAL_os_abi="${GLOBAL_os_abi:-macos}"
 # (page aligned) end of the loaded image; 0 means use LINUX_DEFAULT_BRK_START.
 declare -i GLOBAL_linux_brk_start=0
 declare -i GLOBAL_linux_brk=0 # current program break, 0 = not initialised yet
-# Next address handed out by anonymous mmap (bump allocator, never reused).
+# Next address handed out by anonymous/file mmap (bump allocator, never reused).
 declare -i GLOBAL_linux_mmap_next=$((0x7f0000000000))
 # FS/GS segment bases as set by arch_prctl. Nothing uses them for memory
 # addressing (yet); they are only stored.
 declare -i GLOBAL_fs_base=0
 declare -i GLOBAL_gs_base=0
+# Open read-only host file descriptors (fd >= 3).
+declare -a LINUX_fd_path=()
+declare -ia LINUX_fd_pos=()
+declare -ia LINUX_fd_size=()
+declare -ia LINUX_fd_flags=()
+# Last read-only file-backed mmap reservation (fast path for ld.so MAP_FIXED).
+declare LINUX_ro_mmap_path=""
+declare -i LINUX_ro_mmap_base=0 LINUX_ro_mmap_size=0 LINUX_ro_mmap_reqlen=0 LINUX_ro_mmap_off=0
 
 # Insanity
 declare -a memory
@@ -620,6 +656,26 @@ function read_file_bytes() {
 	read -r -a file_bytes < <(hexdump -v -e '/1 "%u "' "${binary_file}") || :
 }
 
+# Copies `len` bytes from `filepath` starting at `offset` directly into
+# emulated `memory` starting at `dst_addr`, using chunked hexdump + compound
+# array assignment for speed on multi-megabyte ELF binaries and shared libs.
+function load_file_slice_to_memory() {
+	declare -r filepath="$1"
+	declare -ri dst_addr="$2" offset="$3" len="$4"
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	if ((len <= 0)); then
+		return
+	fi
+	declare -ri chunk=512
+	declare -i addr=$((dst_addr))
+	declare line
+	while IFS= read -r line || [[ -n "${line}" ]]; do
+		[[ -z "${line}" ]] && continue
+		eval "memory+=([${addr}]=${line})"
+		((addr += chunk)) || :
+	done < <(hexdump -s $((offset)) -n $((len)) -v -e "${chunk}/1 \"%u \" \"\n\"" "${filepath}")
+}
+
 # Usage: le_bytes <variable name> <offset> <size>
 # Stores the little endian unsigned integer of `size` bytes found at `offset`
 # in `file_bytes` in the variable named `variable name`.
@@ -637,24 +693,211 @@ function le_bytes() {
 	printf -v "${le_var}" '%d' $((le_value))
 }
 
-# Copies `filesz` bytes of the segment in memory and zero fills up to
-# `memsz` (.bss).
+# Fast non-subshell little-endian memory accessors for ELF relocation and kernel
+# struct population. `elf_mem_read64` sets `mem_val` in the caller's scope.
+function elf_mem_read64() {
+	declare -ri a="$1"
+	((mem_val = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 |
+		memory[a + 3] << 24 | memory[a + 4] << 32 | memory[a + 5] << 40 |
+		memory[a + 6] << 48 | memory[a + 7] << 56)) || :
+}
+
+function elf_mem_write64() {
+	declare -ri a="$1" v="$2"
+	((memory[a] = v & 0xff,
+		memory[a + 1] = (v >> 8) & 0xff,
+		memory[a + 2] = (v >> 16) & 0xff,
+		memory[a + 3] = (v >> 24) & 0xff,
+		memory[a + 4] = (v >> 32) & 0xff,
+		memory[a + 5] = (v >> 40) & 0xff,
+		memory[a + 6] = (v >> 48) & 0xff,
+		memory[a + 7] = (v >> 56) & 0xff)) || :
+}
+
+function elf_mem_write32() {
+	declare -ri a="$1" v="$2"
+	((memory[a] = v & 0xff,
+		memory[a + 1] = (v >> 8) & 0xff,
+		memory[a + 2] = (v >> 16) & 0xff,
+		memory[a + 3] = (v >> 24) & 0xff)) || :
+}
+
+# Copies `filesz` bytes of the segment from `filepath` at `offset` into memory
+# at `vaddr`, and zeroes `.bss` up to `memsz`.
 function load_elf_segment() {
-	declare -ri vaddr="$1" offset="$2" filesz="$3" memsz="$4"
-	declare -i i
-	((offset >= 0 && offset + filesz <= ${#file_bytes[@]})) ||
+	declare -r filepath="$1"
+	declare -ri vaddr="$2" offset="$3" filesz="$4" memsz="$5" total_file_size="$6"
+	((offset >= 0 && offset + filesz <= total_file_size)) ||
 		die "ELF: segment at offset 0x%x (size 0x%x) is out of file bounds" \
 			$((offset)) $((filesz))
 	((filesz <= memsz)) ||
 		die "ELF: segment at 0x%x has p_filesz > p_memsz" $((vaddr))
 	debug "ELF: loading segment vaddr: %x offset: %x filesz: %x memsz: %x" \
 		$((vaddr)) $((offset)) $((filesz)) $((memsz))
-	for ((i = 0; i < filesz; i++)); do
-		((memory[vaddr + i] = file_bytes[offset + i])) || :
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	if ((filesz > 0)); then
+		load_file_slice_to_memory "${filepath}" $((vaddr)) $((offset)) $((filesz))
+	fi
+	if ((memsz > filesz)); then
+		zero_memory_range $((vaddr + filesz)) $((memsz - filesz))
+	fi
+}
+
+# Applies an Elf64_Rela table (`DT_RELA` or `DT_JMPREL`) in memory.
+function apply_elf_rela_table() {
+	declare -ri load_base="$1" e_type="$2" table_addr="$3" table_size="$4"
+	declare -ri ent_size="$5" symtab_addr="$6" syment="$7"
+	declare -i off r_offset r_info r_addend r_type r_sym target
+	declare -i sym_addr st_shndx st_value st_size sym_s mem_val copy_i
+
+	for ((off = 0; off + ent_size <= table_size; off += ent_size)); do
+		elf_mem_read64 $((table_addr + off))
+		r_offset=$((mem_val))
+		elf_mem_read64 $((table_addr + off + 8))
+		r_info=$((mem_val))
+		elf_mem_read64 $((table_addr + off + 16))
+		r_addend=$((mem_val))
+		((r_type = r_info & 0xffffffff)) || :
+		((r_sym = (r_info >> 32) & 0xffffffff)) || :
+		((target = (e_type == ET_DYN ? load_base + r_offset : r_offset))) || :
+
+		sym_s=0
+		st_size=0
+		if ((r_sym != 0 && symtab_addr != 0)); then
+			((sym_addr = symtab_addr + r_sym * syment)) || :
+			((st_shndx = memory[sym_addr + 6] | memory[sym_addr + 7] << 8)) || :
+			elf_mem_read64 $((sym_addr + 8))
+			st_value=$((mem_val))
+			elf_mem_read64 $((sym_addr + 16))
+			st_size=$((mem_val))
+			if ((st_shndx == 0)); then
+				sym_s=0
+			elif ((st_shndx == 0xfff1)); then
+				sym_s=$((st_value))
+			else
+				((sym_s = (e_type == ET_DYN ? load_base + st_value : st_value))) || :
+			fi
+		fi
+
+		case $((r_type)) in
+		$((R_X86_64_NONE))) ;;
+		$((R_X86_64_RELATIVE)))
+			elf_mem_write64 $((target)) $((load_base + r_addend))
+			;;
+		$((R_X86_64_64)) | $((R_X86_64_GLOB_DAT)) | $((R_X86_64_JUMP_SLOT)))
+			elf_mem_write64 $((target)) $((sym_s + r_addend))
+			;;
+		$((R_X86_64_PC32)) | $((R_X86_64_PLT32)))
+			elf_mem_write32 $((target)) $(((sym_s + r_addend - target) & 0xffffffff))
+			;;
+		$((R_X86_64_32)) | $((R_X86_64_32S)))
+			elf_mem_write32 $((target)) $(((sym_s + r_addend) & 0xffffffff))
+			;;
+		$((R_X86_64_COPY)))
+			if ((sym_s != 0 && st_size > 0)); then
+				for ((copy_i = 0; copy_i < st_size; copy_i++)); do
+					((memory[target + copy_i] = memory[sym_s + copy_i])) || :
+				done
+			fi
+			;;
+		$((R_X86_64_IRELATIVE)))
+			debug "ELF: skipping R_X86_64_IRELATIVE at 0x%x (resolver 0x%x)" \
+				$((target)) $((load_base + r_addend))
+			;;
+		*)
+			die "ELF: unsupported relocation type %d at 0x%x" $((r_type)) $((target))
+			;;
+		esac
 	done
-	for ((; i < memsz; i++)); do
-		((memory[vaddr + i] = 0)) || :
+}
+
+# Parses PT_DYNAMIC at `dyn_addr` (size `dyn_size`) and applies DT_RELR,
+# DT_RELA, and DT_JMPREL relocations for non-PT_INTERP ELF binaries.
+function apply_elf_relocations() {
+	declare -ri load_base="$1" e_type="$2" dyn_addr="$3" dyn_size="$4"
+	declare -i off d_tag d_val mem_val
+	declare -i strtab=0 symtab=0 syment=24
+	declare -i rela=0 relasz=0 relaent=24 has_rela=0
+	declare -i jmprel=0 pltrelsz=0 pltrel=0 has_jmprel=0
+	declare -i relr=0 relrsz=0 relrent=8 has_relr=0
+
+	for ((off = 0; off + 16 <= dyn_size; off += 16)); do
+		elf_mem_read64 $((dyn_addr + off))
+		d_tag=$((mem_val))
+		elf_mem_read64 $((dyn_addr + off + 8))
+		d_val=$((mem_val))
+		((d_tag == DT_NULL)) && break
+		case $((d_tag)) in
+		$((DT_STRTAB))) strtab=$((d_val)) ;;
+		$((DT_SYMTAB))) symtab=$((d_val)) ;;
+		$((DT_SYMENT))) syment=$((d_val)) ;;
+		$((DT_RELA)))
+			rela=$((d_val))
+			has_rela=1
+			;;
+		$((DT_RELASZ))) relasz=$((d_val)) ;;
+		$((DT_RELAENT))) relaent=$((d_val)) ;;
+		$((DT_PLTREL))) pltrel=$((d_val)) ;;
+		$((DT_JMPREL)))
+			jmprel=$((d_val))
+			has_jmprel=1
+			;;
+		$((DT_PLTRELSZ))) pltrelsz=$((d_val)) ;;
+		$((DT_RELR)))
+			relr=$((d_val))
+			has_relr=1
+			;;
+		$((DT_RELRSZ))) relrsz=$((d_val)) ;;
+		$((DT_RELRENT))) relrent=$((d_val)) ;;
+		esac
 	done
+
+	declare -i symtab_addr=0
+	if ((symtab != 0)); then
+		((symtab_addr = (e_type == ET_DYN ? load_base + symtab : symtab))) || :
+	fi
+	((syment > 0)) || syment=24
+	((relaent > 0)) || relaent=24
+	((relrent > 0)) || relrent=8
+
+	# DT_RELR compact relative relocations.
+	if ((has_relr && relrsz > 0)); then
+		declare -i relr_addr=$((e_type == ET_DYN ? load_base + relr : relr))
+		declare -i where=0 entry bitmap b
+		for ((off = 0; off + relrent <= relrsz; off += relrent)); do
+			elf_mem_read64 $((relr_addr + off))
+			entry=$((mem_val))
+			if (((entry & 1) == 0)); then
+				((where = load_base + entry)) || :
+				elf_mem_read64 $((where))
+				elf_mem_write64 $((where)) $((mem_val + load_base))
+				((where += 8)) || :
+			else
+				((bitmap = (entry >> 1) & ~(1 << 63))) || :
+				for ((b = 0; b < 63 && bitmap != 0; b++, bitmap >>= 1)); do
+					if ((bitmap & 1)); then
+						elf_mem_read64 $((where + b * 8))
+						elf_mem_write64 $((where + b * 8)) $((mem_val + load_base))
+					fi
+				done
+				((where += 63 * 8)) || :
+			fi
+		done
+	fi
+
+	# DT_RELA explicit addend relocations.
+	if ((has_rela && relasz > 0)); then
+		declare -i rela_addr=$((e_type == ET_DYN ? load_base + rela : rela))
+		apply_elf_rela_table $((load_base)) $((e_type)) $((rela_addr)) \
+			$((relasz)) $((relaent)) $((symtab_addr)) $((syment))
+	fi
+
+	# DT_JMPREL PLT relocations (when using Elf64_Rela).
+	if ((has_jmprel && pltrelsz > 0 && (pltrel == DT_RELA || pltrel == 0))); then
+		declare -i jmprel_addr=$((e_type == ET_DYN ? load_base + jmprel : jmprel))
+		apply_elf_rela_table $((load_base)) $((e_type)) $((jmprel_addr)) \
+			$((pltrelsz)) 24 $((symtab_addr)) $((syment))
+	fi
 }
 
 # Writes the NUL terminated string "$2" at address "$1" in memory.
@@ -680,6 +923,7 @@ function put_string() {
 #          padding, AT_RANDOM bytes, argument strings.
 #
 # Usage: setup_linux_stack <entry> <phdr address> <phentsize> <phnum> [argv...]
+# Optional caller variable `elf_at_base` sets AT_BASE (0 if unset).
 function setup_linux_stack() {
 	declare -ri entry="$1" phdr="$2" phentsize="$3" phnum="$4"
 	shift 4
@@ -688,6 +932,8 @@ function setup_linux_stack() {
 	declare -i sp=$((registers[RSP]))
 	declare -ia argv_ptrs=()
 	declare -i i
+
+	[[ -n "${memory[@]+x}" ]] || memory=()
 
 	# Argument strings, last one first so that argv[0] ends up lowest.
 	for ((i = argc - 1; i >= 0; i--)); do
@@ -709,12 +955,12 @@ function setup_linux_stack() {
 		$((AT_PHENT)) $((phentsize))
 		$((AT_PHNUM)) $((phnum))
 		$((AT_PAGESZ)) 4096
-		$((AT_BASE)) 0
+		$((AT_BASE)) $((${elf_at_base:-0}))
 		$((AT_ENTRY)) $((entry))
-		$((AT_UID)) 0
-		$((AT_EUID)) 0
-		$((AT_GID)) 0
-		$((AT_EGID)) 0
+		$((AT_UID)) ${UID}
+		$((AT_EUID)) ${EUID}
+		$((AT_GID)) ${GROUPS[0]:-0}
+		$((AT_EGID)) ${GROUPS[0]:-0}
 		$((AT_RANDOM)) $((random))
 		$((AT_EXECFN)) $((execfn))
 		$((AT_NULL)) 0
@@ -742,28 +988,23 @@ function setup_linux_stack() {
 	debug "ELF: stack set up, RSP: %x argc: %d" $((registers[RSP])) $((argc))
 }
 
-# Loads a static Linux ELF64 x86_64 executable from `binary_file`.
-# Arguments are the guest argv (argv[0] included).
-function load_elf_file() {
-	declare -a file_bytes
-	read_file_bytes
-	declare -ri file_size=${#file_bytes[@]}
+# Maps an ELF64 x86_64 image (`elf_path`) into emulated memory, using `dyn_base`
+# if the image is ET_DYN. Populates caller variables:
+#   img_e_type, img_e_entry, img_e_phentsize, img_e_phnum,
+#   img_load_base, img_phdr_addr, img_text_vmaddr, img_end,
+#   img_dyn_addr, img_dyn_size, img_interp_path
+function load_elf_image() {
+	declare -r elf_path="$1"
+	declare -ri dyn_base="$2"
+	[[ -r "${elf_path}" ]] || die "ELF: cannot read '%s'" "${elf_path}"
 
-	#typedef struct {
-	#	unsigned char e_ident[16]; /* 0: magic, class, data, version... */
-	#	uint16_t e_type;           /* 16 */
-	#	uint16_t e_machine;        /* 18 */
-	#	uint32_t e_version;        /* 20 */
-	#	uint64_t e_entry;          /* 24 */
-	#	uint64_t e_phoff;          /* 32 */
-	#	uint64_t e_shoff;          /* 40 */
-	#	uint32_t e_flags;          /* 48 */
-	#	uint16_t e_ehsize;         /* 52 */
-	#	uint16_t e_phentsize;      /* 54 */
-	#	uint16_t e_phnum;          /* 56 */
-	#	...
-	#} Elf64_Ehdr;
-	((file_size >= 64)) || die "ELF: file too small"
+	declare -i img_file_size
+	img_file_size=$(wc -c <"${elf_path}")
+	((img_file_size >= 64)) || die "ELF: file too small"
+
+	declare -a file_bytes=()
+	read -r -a file_bytes < <(hexdump -n 64 -v -e '/1 "%u "' "${elf_path}") || :
+	((${#file_bytes[@]} >= 64)) || die "ELF: file too small"
 	((file_bytes[0] == 0x7f && file_bytes[1] == 0x45 &&
 		file_bytes[2] == 0x4c && file_bytes[3] == 0x46)) ||
 		die "ELF: can't find magic number"
@@ -772,57 +1013,49 @@ function load_elf_file() {
 	((file_bytes[5] == ELFDATA2LSB)) ||
 		die "ELF: only little endian binaries are supported"
 
-	declare -i e_type e_machine e_entry e_phoff e_phentsize e_phnum
-	le_bytes e_type 16 2
+	declare -i e_machine e_phoff
+	le_bytes img_e_type 16 2
 	le_bytes e_machine 18 2
-	le_bytes e_entry 24 8
+	le_bytes img_e_entry 24 8
 	le_bytes e_phoff 32 8
-	le_bytes e_phentsize 54 2
-	le_bytes e_phnum 56 2
+	le_bytes img_e_phentsize 54 2
+	le_bytes img_e_phnum 56 2
 
 	((e_machine == EM_X86_64)) ||
 		die "ELF: unsupported machine %d, only x86_64 (%d) is supported" \
 			$((e_machine)) $((EM_X86_64))
 
-	declare -i load_base=0
-	case $((e_type)) in
+	img_load_base=0
+	case $((img_e_type)) in
 	$((ET_EXEC))) ;;
 	$((ET_DYN)))
-		# static-pie: load at a fixed base.
-		load_base=$((ELF_DYN_BASE))
+		img_load_base=$((dyn_base))
 		;;
 	*)
-		die "ELF: unsupported type %d, not an executable" $((e_type))
+		die "ELF: unsupported type %d, not an executable" $((img_e_type))
 		;;
 	esac
 
-	((e_phnum > 0)) || die "ELF: no program headers"
-	((e_phentsize >= 56)) || die "ELF: invalid e_phentsize %d" $((e_phentsize))
-	((e_phoff + e_phnum * e_phentsize <= file_size)) ||
+	((img_e_phnum > 0)) || die "ELF: no program headers"
+	((img_e_phentsize >= 56)) || die "ELF: invalid e_phentsize %d" $((img_e_phentsize))
+	declare -ri ph_table_size=$((img_e_phnum * img_e_phentsize))
+	((e_phoff >= 0 && e_phoff + ph_table_size <= img_file_size)) ||
 		die "ELF: program headers are out of file bounds"
 
-	#typedef struct {
-	#	uint32_t p_type;   /* 0 */
-	#	uint32_t p_flags;  /* 4 */
-	#	uint64_t p_offset; /* 8 */
-	#	uint64_t p_vaddr;  /* 16 */
-	#	uint64_t p_paddr;  /* 24 */
-	#	uint64_t p_filesz; /* 32 */
-	#	uint64_t p_memsz;  /* 40 */
-	#	uint64_t p_align;  /* 48 */
-	#} Elf64_Phdr;
-	declare -i i ph p_type p_flags p_offset p_vaddr p_filesz p_memsz
-	# Refuse dynamically linked binaries before loading anything.
-	for ((i = 0; i < e_phnum; i++)); do
-		((ph = e_phoff + i * e_phentsize)) || :
-		le_bytes p_type $((ph)) 4
-		((p_type != PT_INTERP)) ||
-			die "ELF: dynamically linked binaries (PT_INTERP) are not supported, link with -static"
-	done
+	file_bytes=()
+	read -r -a file_bytes < <(hexdump -s $((e_phoff)) -n $((ph_table_size)) -v -e '/1 "%u "' "${elf_path}") || :
 
-	declare -i phdr_addr=0 text_vmaddr=-1 image_end=0
-	for ((i = 0; i < e_phnum; i++)); do
-		((ph = e_phoff + i * e_phentsize)) || :
+	img_phdr_addr=0
+	img_text_vmaddr=-1
+	img_end=0
+	img_dyn_addr=0
+	img_dyn_size=0
+	img_interp_path=""
+	declare -i has_interp=0
+
+	declare -i i ph p_type p_flags p_offset p_vaddr p_filesz p_memsz
+	for ((i = 0; i < img_e_phnum; i++)); do
+		((ph = i * img_e_phentsize)) || :
 		le_bytes p_type $((ph)) 4
 		le_bytes p_flags $((ph + 4)) 4
 		le_bytes p_offset $((ph + 8)) 8
@@ -833,39 +1066,109 @@ function load_elf_file() {
 			$((p_type)) $((p_flags)) $((p_offset)) $((p_vaddr)) $((p_filesz)) $((p_memsz))
 		case $((p_type)) in
 		$((PT_LOAD)))
-			load_elf_segment $((load_base + p_vaddr)) $((p_offset)) $((p_filesz)) $((p_memsz))
-			# The program break starts after the highest loaded segment.
-			if ((load_base + p_vaddr + p_memsz > image_end)); then
-				((image_end = load_base + p_vaddr + p_memsz)) || :
+			load_elf_segment "${elf_path}" $((img_load_base + p_vaddr)) \
+				$((p_offset)) $((p_filesz)) $((p_memsz)) $((img_file_size))
+			if ((img_load_base + p_vaddr + p_memsz > img_end)); then
+				((img_end = img_load_base + p_vaddr + p_memsz)) || :
 			fi
-			# PF_X: the first executable segment plays the role of __TEXT.
-			if ((p_flags & 0x1 && text_vmaddr < 0)); then
-				((text_vmaddr = load_base + p_vaddr)) || :
+			if ((p_flags & 0x1 && img_text_vmaddr < 0)); then
+				((img_text_vmaddr = img_load_base + p_vaddr)) || :
 			fi
-			# Program headers mapped by this segment (for AT_PHDR).
-			if ((phdr_addr == 0 && e_phoff >= p_offset &&
+			if ((img_phdr_addr == 0 && e_phoff >= p_offset &&
 				e_phoff < p_offset + p_filesz)); then
-				((phdr_addr = load_base + p_vaddr + e_phoff - p_offset)) || :
+				((img_phdr_addr = img_load_base + p_vaddr + e_phoff - p_offset)) || :
 			fi
 			;;
 		$((PT_PHDR)))
-			((phdr_addr = load_base + p_vaddr)) || :
+			((img_phdr_addr = img_load_base + p_vaddr)) || :
+			;;
+		$((PT_DYNAMIC)))
+			((img_dyn_addr = img_load_base + p_vaddr)) || :
+			((img_dyn_size = p_memsz > 0 ? p_memsz : p_filesz)) || :
+			;;
+		$((PT_INTERP)))
+			((p_offset >= 0 && p_filesz > 0 && p_offset + p_filesz <= img_file_size)) ||
+				die "ELF: invalid PT_INTERP segment"
+			has_interp=1
+			declare -a interp_bytes=()
+			declare -i ib
+			declare escaped="" ch
+			read -r -a interp_bytes < <(hexdump -s $((p_offset)) -n $((p_filesz)) -v -e '/1 "%u "' "${elf_path}") || :
+			for ((ib = 0; ib < ${#interp_bytes[@]}; ib++)); do
+				((interp_bytes[ib] == 0)) && break
+				printf -v ch '\\x%02x' $((interp_bytes[ib] & 0xff))
+				escaped+="${ch}"
+			done
+			if [[ -n "${escaped}" ]]; then
+				printf -v img_interp_path '%b' "${escaped}"
+			fi
+			[[ -n "${img_interp_path}" ]] || die "ELF: empty PT_INTERP path"
 			;;
 		esac
 	done
 
-	((text_vmaddr >= 0)) || die "ELF: no executable PT_LOAD segment"
+	if ((has_interp)) && [[ ! -f "${img_interp_path}" || ! -r "${img_interp_path}" ]]; then
+		die "ELF: cannot read PT_INTERP interpreter '%s'" "${img_interp_path}"
+	fi
+	((img_text_vmaddr >= 0)) || die "ELF: no executable PT_LOAD segment"
+}
+
+# Loads a static, static-pie, or dynamically linked (PT_INTERP) Linux ELF64
+# x86_64 executable from `binary_file`. Arguments are the guest argv (argv[0]
+# included).
+function load_elf_file() {
+	declare -i img_e_type=0 img_e_entry=0 img_e_phentsize=0 img_e_phnum=0
+	declare -i img_load_base=0 img_phdr_addr=0 img_text_vmaddr=-1 img_end=0
+	declare -i img_dyn_addr=0 img_dyn_size=0
+	declare img_interp_path=""
+
+	load_elf_image "${binary_file}" $((ELF_DYN_BASE))
+
+	declare -ri main_e_type=$((img_e_type))
+	declare -ri main_load_base=$((img_load_base))
+	declare -ri main_entry=$((img_load_base + img_e_entry))
+	declare -ri main_phdr_addr=$((img_phdr_addr))
+	declare -ri main_phentsize=$((img_e_phentsize))
+	declare -ri main_phnum=$((img_e_phnum))
+	declare -ri main_text_vmaddr=$((img_text_vmaddr))
+	declare -ri main_image_end=$((img_end))
+	declare -ri main_dyn_addr=$((img_dyn_addr))
+	declare -ri main_dyn_size=$((img_dyn_size))
+	declare -r interp_path="${img_interp_path}"
+
+	declare -i elf_at_base=0
+	declare -i start_entry=$((main_entry))
+	declare -i start_text_vmaddr=$((main_text_vmaddr))
+
+	if [[ -n "${interp_path}" ]]; then
+		# Dynamically linked binary: load the PT_INTERP dynamic linker and let
+		# _dl_start relocate both itself and the main executable.
+		debug "ELF: loading PT_INTERP interpreter '%s' at 0x%x" \
+			"${interp_path}" $((ELF_INTERP_BASE))
+		load_elf_image "${interp_path}" $((ELF_INTERP_BASE))
+		elf_at_base=$((img_load_base))
+		start_entry=$((img_load_base + img_e_entry))
+		start_text_vmaddr=$((img_text_vmaddr))
+	elif ((main_dyn_addr != 0 && main_dyn_size > 0)); then
+		# Static-PIE / ET_DYN without PT_INTERP: apply loader relocations now.
+		apply_elf_relocations $((main_load_base)) $((main_e_type)) \
+			$((main_dyn_addr)) $((main_dyn_size))
+	fi
 
 	GLOBAL_os_abi="linux"
-	# Page aligned end of the loaded image.
-	((GLOBAL_linux_brk_start = (image_end + 0xfff) & ~0xfff)) || :
+	# Page aligned end of the main executable image.
+	((GLOBAL_linux_brk_start = (main_image_end + 0xfff) & ~0xfff)) || :
 	# run() starts at GLOBAL_text_vmaddr + GLOBAL_entryoff.
-	((GLOBAL_text_vmaddr = text_vmaddr)) || :
-	((GLOBAL_entryoff = load_base + e_entry - text_vmaddr)) || :
-	debug "ELF: entry point: %x" $((load_base + e_entry))
+	((GLOBAL_text_vmaddr = start_text_vmaddr)) || :
+	((GLOBAL_entryoff = start_entry - start_text_vmaddr)) || :
+	debug "ELF: entry point: %x (AT_ENTRY: %x, AT_BASE: %x)" \
+		$((start_entry)) $((main_entry)) $((elf_at_base))
 
-	setup_linux_stack $((load_base + e_entry)) $((phdr_addr)) \
-		$((e_phentsize)) $((e_phnum)) "$@"
+	if ((registers[RSP] == 0x10000)); then
+		registers[RSP]=$((LINUX_INITIAL_RSP))
+	fi
+	setup_linux_stack $((main_entry)) $((main_phdr_addr)) \
+		$((main_phentsize)) $((main_phnum)) "$@"
 }
 
 ### Instruction decoding and execution ###
@@ -2072,18 +2375,28 @@ function inst_syscall_exit() {
 ### Linux kernel emulation ###
 
 declare -ri LINUX_EPERM=1
+declare -ri LINUX_ENOENT=2
+declare -ri LINUX_ENXIO=6
 declare -ri LINUX_EBADF=9
 declare -ri LINUX_ENOMEM=12
+declare -ri LINUX_EACCES=13
 declare -ri LINUX_EFAULT=14
 declare -ri LINUX_ENODEV=19
+declare -ri LINUX_EISDIR=21
 declare -ri LINUX_EINVAL=22
 declare -ri LINUX_ENOTTY=25
+declare -ri LINUX_ESPIPE=29
+declare -ri LINUX_EROFS=30
+declare -ri LINUX_ERANGE=34
 declare -ri LINUX_ENOSYS=38
 
 declare -ri LINUX_PAGE_SIZE=4096
 declare -ri LINUX_DEFAULT_BRK_START=$((0x10000000))
 declare -ri LINUX_MAP_FIXED=$((0x10))
 declare -ri LINUX_MAP_ANONYMOUS=$((0x20))
+declare -ri LINUX_AT_FDCWD=-100
+declare -ri LINUX_AT_SYMLINK_NOFOLLOW=$((0x100))
+declare -ri LINUX_AT_EMPTY_PATH=$((0x1000))
 declare -ri LINUX_ARCH_SET_GS=$((0x1001))
 declare -ri LINUX_ARCH_SET_FS=$((0x1002))
 declare -ri LINUX_ARCH_GET_FS=$((0x1003))
@@ -2092,12 +2405,68 @@ declare -ri LINUX_ARCH_GET_GS=$((0x1004))
 # report IF set plus the always-one reserved bit 1.
 declare -ri LINUX_SYSCALL_RFLAGS=$((0x202))
 
+# Sign-extends a 32-bit int syscall argument (e.g. AT_FDCWD passed via %edi).
+function linux_s32() {
+	echo $(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+}
+
+# Reads a NUL-terminated string from emulated `memory[addr..]` into `guest_str`.
+function read_guest_cstring() {
+	declare -ri addr="$1"
+	declare -i i=0 b
+	declare escaped="" ch
+	guest_str=""
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	while ((i < 4096)); do
+		((b = memory[addr + i] & 0xff)) || :
+		((b == 0)) && break
+		printf -v ch '\\x%02x' $((b))
+		escaped+="${ch}"
+		((i++)) || :
+	done
+	if [[ -n "${escaped}" ]]; then
+		printf -v guest_str '%b' "${escaped}"
+	fi
+}
+
+# Resolves guest path at `path_addr` relative to `dirfd` into `resolved_path`.
+# On error sets `ret` to negative errno and returns 1.
+function linux_resolve_path() {
+	declare -ri dirfd="$1" path_addr="$2"
+	declare guest_str=""
+	read_guest_cstring $((path_addr))
+	if [[ -z "${guest_str}" ]]; then
+		resolved_path=""
+		ret=-LINUX_ENOENT
+		return 1
+	fi
+	if [[ "${guest_str}" == /* ]]; then
+		resolved_path="${guest_str}"
+		return 0
+	fi
+	if ((dirfd == LINUX_AT_FDCWD)); then
+		resolved_path="${PWD}/${guest_str}"
+		return 0
+	fi
+	if ((dirfd >= 3)) && [[ -n "${LINUX_fd_path[dirfd]+x}" && "${LINUX_fd_path[dirfd]}" != stdio:* ]]; then
+		if [[ -d "${LINUX_fd_path[dirfd]}" ]]; then
+			resolved_path="${LINUX_fd_path[dirfd]}/${guest_str}"
+		else
+			resolved_path="$(dirname "${LINUX_fd_path[dirfd]}")/${guest_str}"
+		fi
+		return 0
+	fi
+	ret=-LINUX_EBADF
+	return 1
+}
+
 # Writes `len` bytes of emulated memory starting at `address` to stdout, byte
 # for byte. NUL bytes, newlines, '%' and '\' are all emitted verbatim.
 function print_memory_bytes() {
 	declare -ri address="$1" len="$2"
 	declare -i i
 	declare escaped="" byte
+	[[ -n "${memory[@]+x}" ]] || memory=()
 	for ((i = 0; i < len; i++)); do
 		printf -v byte '\\x%02x' $((${memory[address + i]:-0} & 0xff))
 		escaped="${escaped}${byte}"
@@ -2123,16 +2492,26 @@ function set_memory_string() {
 	done
 }
 
-# Zeroes emulated memory in [address, address + len). Memory is a sparse
-# array, so only the bytes that were ever written need clearing.
+# Zeroes emulated memory in [address, address + len). Chooses whichever of
+# range iteration or sparse-key iteration touches fewer entries.
 function zero_memory_range() {
 	declare -ri address="$1" len="$2"
+	[[ -n "${memory[@]+x}" ]] || { memory=(); return; }
+	if ((len <= 0)); then
+		return
+	fi
 	declare -i i
-	for i in "${!memory[@]}"; do
-		if ((i >= address && i < address + len)); then
+	if ((len <= ${#memory[@]})); then
+		for ((i = address; i < address + len; i++)); do
 			unset 'memory[i]'
-		fi
-	done
+		done
+	else
+		for i in "${!memory[@]}"; do
+			if ((i >= address && i < address + len)); then
+				unset 'memory[i]'
+			fi
+		done
+	fi
 }
 
 # Sets `now_sec` and `now_nsec` to the current wall clock time.
@@ -2147,34 +2526,91 @@ function linux_time_now() {
 	fi
 }
 
-# read(fd, buf, count): only fd 0 is supported. Reads at most `count` bytes
-# from stdin, returning early after a newline (like a terminal would), or at
-# end of file.
+# read(fd, buf, count): fd 0 reads stdin; fd >= 3 reads an open host file.
 function linux_sys_read() {
-	declare -ri fd="$1" buf="$2" count="$3"
-	if ((fd != 0)); then
+	declare -ri fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri buf="$2" count="$3"
+	if ((count < 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	if ((fd == 0)) || [[ "${LINUX_fd_path[fd]:-}" == "stdio:0" ]]; then
+		declare LC_ALL=C
+		declare -i n=0 code
+		declare c
+		while ((n < count)); do
+			# With -d '' a NUL byte acts as the delimiter, and reads as "".
+			IFS= read -r -n 1 -d '' c || break
+			printf -v code '%d' "'${c}"
+			memory[buf + n]=$((code & 0xff))
+			((n++)) || :
+			if ((code == 10)); then
+				break
+			fi
+		done
+		ret=$((n))
+		return
+	fi
+	if ((fd < 3)) || [[ -z "${LINUX_fd_path[fd]+x}" || "${LINUX_fd_path[fd]}" == stdio:* ]]; then
 		ret=-LINUX_EBADF
 		return
 	fi
-	declare LC_ALL=C
-	declare -i n=0 code
-	declare c
-	while ((n < count)); do
-		# With -d '' a NUL byte acts as the delimiter, and reads as "".
-		IFS= read -r -n 1 -d '' c || break
-		printf -v code '%d' "'${c}"
-		memory[buf + n]=$((code & 0xff))
-		((n++)) || :
-		if ((code == 10)); then
-			break
-		fi
-	done
-	ret=$((n))
+	declare -r fpath="${LINUX_fd_path[fd]}"
+	if [[ -d "${fpath}" ]]; then
+		ret=-LINUX_EISDIR
+		return
+	fi
+	declare -ri pos=${LINUX_fd_pos[fd]} fsize=${LINUX_fd_size[fd]}
+	if ((count == 0 || pos >= fsize)); then
+		ret=0
+		return
+	fi
+	declare -i avail=$((fsize - pos))
+	((avail > count)) && avail=$((count))
+	load_file_slice_to_memory "${fpath}" $((buf)) $((pos)) $((avail))
+	((LINUX_fd_pos[fd] = pos + avail)) || :
+	ret=$((avail))
+}
+
+# pread64(fd, buf, count, offset): reads at `offset` without changing fd_pos.
+function linux_sys_pread64() {
+	declare -ri fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri buf="$2" count="$3" offset="$4"
+	if ((count < 0 || offset < 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	if ((fd >= 0 && fd <= 2)); then
+		ret=-LINUX_ESPIPE
+		return
+	fi
+	if ((fd < 3)) || [[ -z "${LINUX_fd_path[fd]+x}" || "${LINUX_fd_path[fd]}" == stdio:* ]]; then
+		ret=-LINUX_EBADF
+		return
+	fi
+	declare -r fpath="${LINUX_fd_path[fd]}"
+	if [[ -d "${fpath}" ]]; then
+		ret=-LINUX_EISDIR
+		return
+	fi
+	declare -ri fsize=${LINUX_fd_size[fd]}
+	if ((count == 0 || offset >= fsize)); then
+		ret=0
+		return
+	fi
+	declare -i avail=$((fsize - offset))
+	((avail > count)) && avail=$((count))
+	load_file_slice_to_memory "${fpath}" $((buf)) $((offset)) $((avail))
+	ret=$((avail))
 }
 
 # write(fd, buf, count) for fd 1 (stdout) and 2 (stderr).
 function linux_sys_write() {
-	declare -ri fd="$1" buf="$2" count="$3"
+	declare -i fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri buf="$2" count="$3"
+	if ((fd >= 3)) && [[ "${LINUX_fd_path[fd]:-}" == stdio:* ]]; then
+		fd=$((${LINUX_fd_path[fd]#stdio:}))
+	fi
 	case $((fd)) in
 	1 | 2)
 		print_memory_bytes $((buf)) $((count)) >&$((fd))
@@ -2188,19 +2624,374 @@ function linux_sys_write() {
 
 # writev(fd, iov, iovcnt). struct iovec { void *iov_base; size_t iov_len; }
 function linux_sys_writev() {
-	declare -ri fd="$1" iov="$2" iovcnt="$3"
+	declare -i fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri iov="$2" iovcnt=$(((($3 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	if ((fd >= 3)) && [[ "${LINUX_fd_path[fd]:-}" == stdio:* ]]; then
+		fd=$((${LINUX_fd_path[fd]#stdio:}))
+	fi
 	if ((fd != 1 && fd != 2)); then
 		ret=-LINUX_EBADF
 		return
 	fi
-	declare -i i base len total=0
+	declare -i i base len total=0 mem_val
+	[[ -n "${memory[@]+x}" ]] || memory=()
 	for ((i = 0; i < iovcnt; i++)); do
-		base=$(get_memory 8 $((iov + 16 * i)))
-		len=$(get_memory 8 $((iov + 16 * i + 8)))
+		elf_mem_read64 $((iov + 16 * i))
+		base=$((mem_val))
+		elf_mem_read64 $((iov + 16 * i + 8))
+		len=$((mem_val))
 		print_memory_bytes $((base)) $((len)) >&$((fd))
 		((total += len)) || :
 	done
 	ret=$((total))
+}
+
+# openat(dirfd, path, flags, mode): read-only access to host files/directories.
+function linux_sys_openat() {
+	declare -ri dirfd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri path_addr="$2"
+	declare -ri flags=$(((($3 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare resolved_path=""
+	linux_resolve_path $((dirfd)) $((path_addr)) || return
+	debug "openat(%d, '%s', 0x%x)" $((dirfd)) "${resolved_path}" $((flags))
+
+	if [[ -e "${resolved_path}" && ! -f "${resolved_path}" && ! -d "${resolved_path}" ]]; then
+		ret=-LINUX_ENXIO
+		return
+	fi
+	# O_WRONLY (1), O_RDWR (2), O_CREAT (0x40), O_TRUNC (0x200) are refused.
+	if (((flags & 0x3) != 0 || (flags & 0x240) != 0)); then
+		ret=-LINUX_EACCES
+		return
+	fi
+	if [[ ! -e "${resolved_path}" ]]; then
+		ret=-LINUX_ENOENT
+		return
+	fi
+	if [[ ! -r "${resolved_path}" ]]; then
+		ret=-LINUX_EACCES
+		return
+	fi
+
+	declare -i fd
+	for ((fd = 3; ; fd++)); do
+		if [[ -z "${LINUX_fd_path[fd]+x}" ]]; then
+			break
+		fi
+	done
+	LINUX_fd_path[fd]="${resolved_path}"
+	LINUX_fd_pos[fd]=0
+	if [[ -f "${resolved_path}" ]]; then
+		LINUX_fd_size[fd]=$(wc -c <"${resolved_path}")
+	else
+		LINUX_fd_size[fd]=4096
+	fi
+	LINUX_fd_flags[fd]=$((flags))
+	ret=$((fd))
+}
+
+function linux_sys_close() {
+	declare -ri fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	if ((fd >= 0 && fd <= 2)); then
+		ret=0
+	elif ((fd >= 3)) && [[ -n "${LINUX_fd_path[fd]+x}" ]]; then
+		unset 'LINUX_fd_path[fd]' 'LINUX_fd_pos[fd]' 'LINUX_fd_size[fd]' 'LINUX_fd_flags[fd]'
+		ret=0
+	else
+		ret=-LINUX_EBADF
+	fi
+}
+
+# Populates a 144-byte x86_64 Linux `struct stat` at `statbuf` from `target_path`.
+function linux_fill_stat_path() {
+	declare -r target_path="$1" deref="$2"
+	declare -ri statbuf="$3"
+	declare -i i
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	if [[ "${deref}" == "-L" ]]; then
+		[[ -e "${target_path}" ]] || { ret=-LINUX_ENOENT; return; }
+	else
+		[[ -e "${target_path}" || -L "${target_path}" ]] || { ret=-LINUX_ENOENT; return; }
+	fi
+
+	declare st_dev=1 st_ino=1 st_nlink=1 st_mode=0x81a4 st_uid=${UID}
+	declare st_gid=${GROUPS[0]:-0} st_size=0 st_mtime=0
+	if [[ "${deref}" == "-L" ]]; then
+		read -r st_dev st_ino st_nlink st_mode st_uid st_gid st_size st_mtime \
+			< <(stat -L -c '%d %i %h 0x%f %u %g %s %Y' "${target_path}" 2>/dev/null) || :
+	else
+		read -r st_dev st_ino st_nlink st_mode st_uid st_gid st_size st_mtime \
+			< <(stat -c '%d %i %h 0x%f %u %g %s %Y' "${target_path}" 2>/dev/null) || :
+	fi
+
+	for ((i = 0; i < 144; i++)); do
+		memory[statbuf + i]=0
+	done
+	elf_mem_write64 $((statbuf + 0)) $((st_dev))
+	elf_mem_write64 $((statbuf + 8)) $((st_ino))
+	elf_mem_write64 $((statbuf + 16)) $((st_nlink))
+	elf_mem_write32 $((statbuf + 24)) $((st_mode))
+	elf_mem_write32 $((statbuf + 28)) $((st_uid))
+	elf_mem_write32 $((statbuf + 32)) $((st_gid))
+	elf_mem_write64 $((statbuf + 48)) $((st_size))
+	elf_mem_write64 $((statbuf + 56)) 4096
+	elf_mem_write64 $((statbuf + 64)) $(((st_size + 511) / 512))
+	elf_mem_write64 $((statbuf + 72)) $((st_mtime))
+	elf_mem_write64 $((statbuf + 88)) $((st_mtime))
+	elf_mem_write64 $((statbuf + 104)) $((st_mtime))
+	ret=0
+}
+
+function linux_sys_fstat() {
+	declare -i fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri statbuf="$2"
+	declare -i i
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	if ((fd >= 3)) && [[ "${LINUX_fd_path[fd]:-}" == stdio:* ]]; then
+		fd=$((${LINUX_fd_path[fd]#stdio:}))
+	fi
+	if ((fd >= 0 && fd <= 2)); then
+		for ((i = 0; i < 144; i++)); do
+			memory[statbuf + i]=0
+		done
+		elf_mem_write64 $((statbuf + 0)) 1
+		elf_mem_write64 $((statbuf + 8)) $((fd + 1))
+		elf_mem_write64 $((statbuf + 16)) 1
+		# S_IFCHR | 0620 (0020620 = 0x2190)
+		elf_mem_write32 $((statbuf + 24)) $((0x2190))
+		elf_mem_write32 $((statbuf + 28)) ${UID}
+		elf_mem_write32 $((statbuf + 32)) ${GROUPS[0]:-0}
+		elf_mem_write64 $((statbuf + 56)) 4096
+		ret=0
+		return
+	fi
+	if ((fd < 3)) || [[ -z "${LINUX_fd_path[fd]+x}" ]]; then
+		ret=-LINUX_EBADF
+		return
+	fi
+	linux_fill_stat_path "${LINUX_fd_path[fd]}" "-L" $((statbuf))
+}
+
+function linux_sys_newfstatat() {
+	declare -ri dirfd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri path_addr="$2" statbuf="$3"
+	declare -ri flags=$(((($4 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare guest_str=""
+	read_guest_cstring $((path_addr))
+	if [[ -z "${guest_str}" ]]; then
+		if ((flags & LINUX_AT_EMPTY_PATH)); then
+			linux_sys_fstat $((dirfd)) $((statbuf))
+		else
+			ret=-LINUX_ENOENT
+		fi
+		return
+	fi
+	declare resolved_path=""
+	linux_resolve_path $((dirfd)) $((path_addr)) || return
+	if ((flags & LINUX_AT_SYMLINK_NOFOLLOW)); then
+		linux_fill_stat_path "${resolved_path}" "" $((statbuf))
+	else
+		linux_fill_stat_path "${resolved_path}" "-L" $((statbuf))
+	fi
+}
+
+function linux_sys_lseek() {
+	declare -ri fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri offset="$2"
+	declare -ri whence=$(((($3 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	if ((fd >= 0 && fd <= 2)) || [[ "${LINUX_fd_path[fd]:-}" == stdio:* ]]; then
+		ret=-LINUX_ESPIPE
+		return
+	fi
+	if ((fd < 3)) || [[ -z "${LINUX_fd_path[fd]+x}" ]]; then
+		ret=-LINUX_EBADF
+		return
+	fi
+	declare -i new_pos=0
+	case $((whence)) in
+	0) new_pos=$((offset)) ;;
+	1) new_pos=$((LINUX_fd_pos[fd] + offset)) ;;
+	2) new_pos=$((LINUX_fd_size[fd] + offset)) ;;
+	*)
+		ret=-LINUX_EINVAL
+		return
+		;;
+	esac
+	if ((new_pos < 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	LINUX_fd_pos[fd]=$((new_pos))
+	ret=$((new_pos))
+}
+
+function linux_sys_faccessat() {
+	declare -ri dirfd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri path_addr="$2"
+	declare -ri mode=$(((($3 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare resolved_path=""
+	linux_resolve_path $((dirfd)) $((path_addr)) || return
+	if [[ ! -e "${resolved_path}" ]]; then
+		ret=-LINUX_ENOENT
+		return
+	fi
+	if ((mode & 2)); then
+		ret=-LINUX_EACCES
+		return
+	fi
+	if ((mode & 4)) && [[ ! -r "${resolved_path}" ]]; then
+		ret=-LINUX_EACCES
+		return
+	fi
+	if ((mode & 1)) && [[ ! -x "${resolved_path}" ]]; then
+		ret=-LINUX_EACCES
+		return
+	fi
+	ret=0
+}
+
+function linux_sys_fcntl() {
+	declare -ri fd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri cmd=$(((($2 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri arg="$3"
+	if ((fd < 0)) || { ((fd >= 3)) && [[ -z "${LINUX_fd_path[fd]+x}" ]]; }; then
+		ret=-LINUX_EBADF
+		return
+	fi
+	case $((cmd)) in
+	0 | 1030) # F_DUPFD, F_DUPFD_CLOEXEC
+		declare -i minfd=$(((($arg & 0xffffffff) ^ 0x80000000) - 0x80000000))
+		if ((minfd < 0)); then
+			ret=-LINUX_EINVAL
+			return
+		fi
+		((minfd < 3)) && minfd=3
+		declare -i newfd
+		for ((newfd = minfd; ; newfd++)); do
+			if [[ -z "${LINUX_fd_path[newfd]+x}" ]]; then
+				break
+			fi
+		done
+		if ((fd >= 0 && fd <= 2)); then
+			LINUX_fd_path[newfd]="stdio:${fd}"
+			LINUX_fd_pos[newfd]=0
+			LINUX_fd_size[newfd]=0
+			LINUX_fd_flags[newfd]=0
+		else
+			LINUX_fd_path[newfd]="${LINUX_fd_path[fd]}"
+			LINUX_fd_pos[newfd]=$((LINUX_fd_pos[fd]))
+			LINUX_fd_size[newfd]=$((LINUX_fd_size[fd]))
+			LINUX_fd_flags[newfd]=$((LINUX_fd_flags[fd]))
+		fi
+		ret=$((newfd))
+		;;
+	1 | 2 | 4) # F_GETFD, F_SETFD, F_SETFL
+		ret=0
+		;;
+	3) # F_GETFL
+		ret=$((fd >= 3 ? (LINUX_fd_flags[fd] & ~0x80000) : 0))
+		;;
+	*)
+		ret=-LINUX_EINVAL
+		;;
+	esac
+}
+
+function linux_sys_getcwd() {
+	declare -ri buf="$1" size="$2"
+	declare -r cwd="${PWD}"
+	declare -ri need=$((${#cwd} + 1))
+	if ((size < need)); then
+		ret=-LINUX_ERANGE
+		return
+	fi
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	put_string $((buf)) "${cwd}"
+	ret=$((need))
+}
+
+function linux_sys_readlinkat() {
+	declare -ri dirfd=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri path_addr="$2" buf="$3" bufsiz="$4"
+	if ((bufsiz <= 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	declare resolved_path=""
+	linux_resolve_path $((dirfd)) $((path_addr)) || return
+	if [[ ! -e "${resolved_path}" && ! -L "${resolved_path}" ]]; then
+		ret=-LINUX_ENOENT
+		return
+	fi
+	if [[ ! -L "${resolved_path}" ]]; then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	declare target
+	target=$(readlink "${resolved_path}")
+	declare LC_ALL=C
+	declare -i n=${#target} i c
+	((n > bufsiz)) && n=$((bufsiz))
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	for ((i = 0; i < n; i++)); do
+		printf -v c '%d' "'${target:i:1}"
+		memory[buf + i]=$((c & 0xff))
+	done
+	ret=$((n))
+}
+
+function linux_sys_prlimit64() {
+	declare -ri pid=$(((($1 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri resource=$(((($2 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri old_limit="$4"
+	if ((pid != 0 && pid != $$)); then
+		ret=-LINUX_EPERM
+		return
+	fi
+	if ((old_limit != 0)); then
+		[[ -n "${memory[@]+x}" ]] || memory=()
+		declare -i cur=-1
+		case $((resource)) in
+		3) cur=$((8 * 1024 * 1024)) ;; # RLIMIT_STACK
+		7) cur=1024 ;;                 # RLIMIT_NOFILE
+		esac
+		elf_mem_write64 $((old_limit)) $((cur))
+		elf_mem_write64 $((old_limit + 8)) -1
+	fi
+	ret=0
+}
+
+function linux_sys_getresuid() {
+	declare -ri ruid="$1" euid="$2" suid="$3"
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	((ruid != 0)) && elf_mem_write32 $((ruid)) ${UID}
+	((euid != 0)) && elf_mem_write32 $((euid)) ${EUID}
+	((suid != 0)) && elf_mem_write32 $((suid)) ${EUID}
+	ret=0
+}
+
+function linux_sys_getresgid() {
+	declare -ri rgid="$1" egid="$2" sgid="$3"
+	declare -ri gid=${GROUPS[0]:-0}
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	((rgid != 0)) && elf_mem_write32 $((rgid)) $((gid))
+	((egid != 0)) && elf_mem_write32 $((egid)) $((gid))
+	((sgid != 0)) && elf_mem_write32 $((sgid)) $((gid))
+	ret=0
+}
+
+function linux_sys_getrandom() {
+	declare -ri buf="$1" buflen="$2"
+	if ((buflen < 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	[[ -n "${memory[@]+x}" ]] || memory=()
+	declare -i i
+	for ((i = 0; i < buflen; i++)); do
+		((memory[buf + i] = RANDOM & 0xff)) || :
+	done
+	ret=$((buflen))
 }
 
 # brk(addr): returns the new program break, or the current one if `addr` is 0
@@ -2208,6 +2999,7 @@ function linux_sys_writev() {
 # shrinking zeroes the released bytes so that growing again reads zeros.
 function linux_sys_brk() {
 	declare -ri addr="$1"
+	[[ -n "${memory[@]+x}" ]] || memory=()
 	if ((GLOBAL_linux_brk_start == 0)); then
 		GLOBAL_linux_brk_start=$((LINUX_DEFAULT_BRK_START))
 	fi
@@ -2223,35 +3015,108 @@ function linux_sys_brk() {
 	ret=$((GLOBAL_linux_brk))
 }
 
-# mmap(addr, length, prot, flags, fd, offset): anonymous mappings only.
-# Without MAP_FIXED, memory comes from a bump allocator and is never reused.
+# mmap(addr, length, prot, flags, fd, offset): supports both anonymous and
+# read-only file-backed mappings. Without MAP_FIXED, memory comes from a bump
+# allocator and is never reused.
 function linux_sys_mmap() {
-	declare -ri addr="$1" length="$2" prot="$3" flags="$4" fd="$5" offset="$6"
+	declare -ri addr="$1" length="$2"
+	declare -ri prot=$(((($3 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri flags=$(((($4 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri fd=$(((($5 & 0xffffffff) ^ 0x80000000) - 0x80000000))
+	declare -ri offset="$6"
+	[[ -n "${memory[@]+x}" ]] || memory=()
 	if ((length <= 0)); then
 		ret=-LINUX_EINVAL
 		return
 	fi
-	if (((flags & LINUX_MAP_ANONYMOUS) == 0)); then
-		debug "mmap: file backed mappings are not supported (fd %d)" $((fd))
+	declare -ri size=$(((length + LINUX_PAGE_SIZE - 1) & ~(LINUX_PAGE_SIZE - 1)))
+
+	if ((flags & LINUX_MAP_ANONYMOUS)); then
+		if ((flags & LINUX_MAP_FIXED)); then
+			if ((addr & (LINUX_PAGE_SIZE - 1))); then
+				ret=-LINUX_EINVAL
+				return
+			fi
+			LINUX_ro_mmap_path=""
+			zero_memory_range $((addr)) $((size))
+			ret=$((addr))
+			return
+		fi
+		if ((GLOBAL_linux_mmap_next + size > ELF_INTERP_BASE)); then
+			ret=-LINUX_ENOMEM
+			return
+		fi
+		ret=$((GLOBAL_linux_mmap_next))
+		((GLOBAL_linux_mmap_next += size)) || :
+		return
+	fi
+
+	# File-backed mapping.
+	if ((offset < 0 || (offset & (LINUX_PAGE_SIZE - 1)) != 0)); then
+		ret=-LINUX_EINVAL
+		return
+	fi
+	if ((fd >= 0 && fd <= 2)) || [[ "${LINUX_fd_path[fd]:-}" == stdio:* ]]; then
 		ret=-LINUX_ENODEV
 		return
 	fi
-	declare -ri size=$(((length + LINUX_PAGE_SIZE - 1) & ~(LINUX_PAGE_SIZE - 1)))
+	if ((fd < 3)) || [[ -z "${LINUX_fd_path[fd]+x}" ]]; then
+		ret=-LINUX_EBADF
+		return
+	fi
+	declare -r fpath="${LINUX_fd_path[fd]}"
+	if [[ ! -f "${fpath}" ]]; then
+		ret=-LINUX_ENODEV
+		return
+	fi
+	declare -ri fsize=${LINUX_fd_size[fd]}
+	declare -i map_addr=0
+
 	if ((flags & LINUX_MAP_FIXED)); then
 		if ((addr & (LINUX_PAGE_SIZE - 1))); then
 			ret=-LINUX_EINVAL
 			return
 		fi
+		# Fast path: ld.so reserves the full library range with PROT_READ and
+		# immediately remaps segments with MAP_FIXED at identical file offsets.
+		if [[ -n "${LINUX_ro_mmap_path}" && "${fpath}" == "${LINUX_ro_mmap_path}" ]] &&
+			((addr >= LINUX_ro_mmap_base &&
+				addr + size <= LINUX_ro_mmap_base + LINUX_ro_mmap_size &&
+				addr + length <= LINUX_ro_mmap_base + LINUX_ro_mmap_reqlen &&
+				addr - LINUX_ro_mmap_base == offset - LINUX_ro_mmap_off)); then
+			if ((prot & 0x2)); then
+				LINUX_ro_mmap_path=""
+			fi
+			ret=$((addr))
+			return
+		fi
+		LINUX_ro_mmap_path=""
 		zero_memory_range $((addr)) $((size))
-		ret=$((addr))
-		return
+		map_addr=$((addr))
+	else
+		if ((GLOBAL_linux_mmap_next + size > ELF_INTERP_BASE)); then
+			ret=-LINUX_ENOMEM
+			return
+		fi
+		map_addr=$((GLOBAL_linux_mmap_next))
+		((GLOBAL_linux_mmap_next += size)) || :
+		if (((prot & 0x2) == 0)); then
+			LINUX_ro_mmap_path="${fpath}"
+			LINUX_ro_mmap_base=$((map_addr))
+			LINUX_ro_mmap_size=$((size))
+			LINUX_ro_mmap_reqlen=$((length))
+			LINUX_ro_mmap_off=$((offset))
+		else
+			LINUX_ro_mmap_path=""
+		fi
 	fi
-	if ((GLOBAL_linux_mmap_next + size > 0x7ffffffff000)); then
-		ret=-LINUX_ENOMEM
-		return
+
+	if ((offset < fsize)); then
+		declare -i avail=$((fsize - offset))
+		((avail > length)) && avail=$((length))
+		load_file_slice_to_memory "${fpath}" $((map_addr)) $((offset)) $((avail))
 	fi
-	ret=$((GLOBAL_linux_mmap_next))
-	((GLOBAL_linux_mmap_next += size)) || :
+	ret=$((map_addr))
 }
 
 # uname(buf): struct utsname has 6 fields of 65 bytes each.
@@ -2349,13 +3214,32 @@ function syscall_linux() {
 	1) # write
 		linux_sys_write $((a0)) $((a1)) $((a2))
 		;;
+	2) # open
+		linux_sys_openat $((LINUX_AT_FDCWD)) $((a0)) $((a1)) $((a2))
+		;;
 	3) # close
-		if ((a0 >= 0 && a0 <= 2)); then ret=0; else ret=-LINUX_EBADF; fi
+		linux_sys_close $((a0))
+		;;
+	4) # stat
+		linux_sys_newfstatat $((LINUX_AT_FDCWD)) $((a0)) $((a1)) 0
+		;;
+	5) # fstat
+		linux_sys_fstat $((a0)) $((a1))
+		;;
+	6) # lstat
+		linux_sys_newfstatat $((LINUX_AT_FDCWD)) $((a0)) $((a1)) $((LINUX_AT_SYMLINK_NOFOLLOW))
+		;;
+	8) # lseek
+		linux_sys_lseek $((a0)) $((a1)) $((a2))
 		;;
 	9) # mmap
 		linux_sys_mmap $((a0)) $((a1)) $((a2)) $((a3)) $((a4)) $((a5))
 		;;
-	10 | 11) # mprotect, munmap: nothing to do, memory is not protected
+	10) # mprotect: nothing to do, memory is not protected
+		ret=0
+		;;
+	11) # munmap
+		LINUX_ro_mmap_path=""
 		ret=0
 		;;
 	12) # brk
@@ -2367,8 +3251,17 @@ function syscall_linux() {
 	16) # ioctl: no file descriptor is a terminal
 		ret=-LINUX_ENOTTY
 		;;
+	17) # pread64
+		linux_sys_pread64 $((a0)) $((a1)) $((a2)) $((a3))
+		;;
 	20) # writev
 		linux_sys_writev $((a0)) $((a1)) $((a2))
+		;;
+	21) # access
+		linux_sys_faccessat $((LINUX_AT_FDCWD)) $((a0)) $((a1))
+		;;
+	32) # dup
+		linux_sys_fcntl $((a0)) 0 0
 		;;
 	39 | 186) # getpid, gettid
 		ret=$$
@@ -2380,17 +3273,41 @@ function syscall_linux() {
 	63) # uname
 		linux_sys_uname $((a0))
 		;;
+	72) # fcntl
+		linux_sys_fcntl $((a0)) $((a1)) $((a2))
+		;;
+	79) # getcwd
+		linux_sys_getcwd $((a0)) $((a1))
+		;;
+	89) # readlink
+		linux_sys_readlinkat $((LINUX_AT_FDCWD)) $((a0)) $((a1)) $((a2))
+		;;
 	96) # gettimeofday
 		linux_sys_gettimeofday $((a0))
+		;;
+	97) # getrlimit
+		linux_sys_prlimit64 0 $((a0)) 0 $((a1))
 		;;
 	102) # getuid
 		ret=${UID}
 		;;
+	104 | 108) # getgid, getegid
+		ret=${GROUPS[0]:-0}
+		;;
 	107) # geteuid
 		ret=${EUID}
 		;;
-	104 | 108) # getgid, getegid
-		ret=${GROUPS[0]:-0}
+	110) # getppid
+		ret=${PPID:-1}
+		;;
+	111) # getpgrp
+		ret=$$
+		;;
+	118) # getresuid
+		linux_sys_getresuid $((a0)) $((a1)) $((a2))
+		;;
+	120) # getresgid
+		linux_sys_getresgid $((a0)) $((a1)) $((a2))
 		;;
 	158) # arch_prctl
 		linux_sys_arch_prctl $((a0)) $((a1))
@@ -2398,11 +3315,35 @@ function syscall_linux() {
 	201) # time
 		linux_sys_time $((a0))
 		;;
+	202 | 273) # futex, set_robust_list
+		ret=0
+		;;
 	218) # set_tid_address: returns the thread id
 		ret=$$
 		;;
 	228) # clock_gettime
 		linux_sys_clock_gettime $((a0)) $((a1))
+		;;
+	257) # openat
+		linux_sys_openat $((a0)) $((a1)) $((a2)) $((a3))
+		;;
+	262) # newfstatat
+		linux_sys_newfstatat $((a0)) $((a1)) $((a2)) $((a3))
+		;;
+	267) # readlinkat
+		linux_sys_readlinkat $((a0)) $((a1)) $((a2)) $((a3))
+		;;
+	269 | 439) # faccessat, faccessat2
+		linux_sys_faccessat $((a0)) $((a1)) $((a2))
+		;;
+	302) # prlimit64
+		linux_sys_prlimit64 $((a0)) $((a1)) $((a2)) $((a3))
+		;;
+	318) # getrandom
+		linux_sys_getrandom $((a0)) $((a1)) $((a2))
+		;;
+	334) # rseq
+		ret=-LINUX_ENOSYS
 		;;
 	*)
 		debug "Unimplemented Linux syscall %d, returning -ENOSYS" $((nr))
@@ -2426,6 +3367,7 @@ function run() {
 
 function init() {
 	typeset -i i
+	[[ -n "${memory[@]+x}" ]] || memory=()
 	for ((i = 0; i < 16; i++)); do
 		registers[$i]=0
 	done
