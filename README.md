@@ -4,7 +4,7 @@ Spleen is a x86_64 CPU emulator written in bash.
 
 ## Overview
 
-Spleen is a bash script that loads an x86_64 OSX binary from disk and run the binary without executing native code on host machine.
+Spleen is a bash script that loads an x86_64 OSX (Mach-O) or Linux (ELF) binary from disk and run the binary without executing native code on host machine.
 Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
 
 ## Example
@@ -24,13 +24,31 @@ Hello World!
 
 `` ` ./run-examples.sh` ``
 
-* Rebuild the examples from C on an OSX machine with:
+* Rebuild the examples with the command below. The Mach-O examples (`examples/*.c`) are only built on an OSX machine,
+  the Linux ELF examples (`examples/*.S`) are built with `cc -nostdlib -static -no-pie` on Linux
+  (or with the cross compiler given in `LINUX_CC`):
 
 `` ` ./gen-examples.sh` ``
 
 * Run tests with:
 
 `` ` ./run-tests.bash` ``
+
+## Supported binary formats
+
+The format is detected from the magic number of the binary.
+
+* **Mach-O** (`0xfeedfacf`): 64 bit `MH_EXECUTE` OSX executables, entry point from `LC_MAIN`. Only `__TEXT` is loaded.
+* **ELF** (`0x7f 'E' 'L' 'F'`): `ELFCLASS64`, little endian, `EM_X86_64` executables.
+  * `ET_EXEC` binaries are loaded at their link addresses; `ET_DYN` (static-pie) binaries at the fixed base `0x555555554000`.
+    Note that spleen does not apply relocations, a static-pie binary has to relocate itself.
+  * Every `PT_LOAD` segment is mapped at `p_vaddr` (`p_filesz` bytes copied from the file, zero filled up to `p_memsz`).
+  * Dynamically linked binaries (with a `PT_INTERP` program header) are refused: link with `-static` and without libc.
+  * The initial stack follows the SysV ABI: `argc`, `argv` (the binary path and extra arguments given to `spleen.bash`),
+    an empty `envp` and a minimal auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`...).
+
+The loader sets `GLOBAL_os_abi` to `macos` or `linux` so that the syscall emulation knows which kernel ABI to emulate.
+`examples/hi-linux.S` is a static, libc free Linux "Hello World!" (`examples-bin/hi-linux`).
 
 ## Supported instructions
 
@@ -92,7 +110,7 @@ The emulator supports a limited number of instructions. It's fairly possible tha
 
 ### Why and OSX binary (Mach-O)?
 
-I was on a mac when I had this terrible idea.
+I was on a mac when I had this terrible idea. Linux ELF binaries are now supported as well.
 
 ### Will you support more instructions, CPUs, binary formats?
 
