@@ -191,6 +191,29 @@ declare -a memory
 
 declare -a registers
 
+# Instruction decoding state. Shadowed by run(), declared globally so that the
+# instruction helpers can be used directly (e.g. by the tests).
+declare -i rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
+declare -i rip=0 advance=0 val=0 cond=0
+
+# RFLAGS, one variable per flag.
+declare -i flag_cf=0 flag_pf=0 flag_af=0 flag_zf=0 flag_sf=0 flag_of=0 flag_df=0
+declare -ri INT64_MIN=$((1 << 63))
+
+# parity_table[byte] is 1 when byte has an even number of bits set (PF).
+declare -a parity_table
+function init_parity_table() {
+	declare -i i b p
+	for ((i = 0; i < 256; i++)); do
+		p=1
+		for ((b = i; b; b >>= 1)); do
+			((p ^= b & 1)) || :
+		done
+		parity_table[i]=$((p))
+	done
+}
+init_parity_table
+
 function register_name() {
 	declare -ri reg="$1"
 	case $((reg)) in
@@ -845,11 +868,17 @@ function load_elf_file() {
 		$((e_phentsize)) $((e_phnum)) "$@"
 }
 
-function inst_push() {
-	declare -i reg="$1"
-	((registers[${RSP}] -= 8)) || :
-	((memory[registers[RSP]]=registers[reg])) || :
-}
+### Instruction decoding and execution ###
+#
+# Conventions used by the helpers below (we use bash dynamic scoping a lot):
+# * Values of 1, 2 and 4 bytes are kept zero-extended. 8 byte values are kept
+#   as (signed) bash integers, the bit pattern is what matters.
+# * Helpers avoid subshells ($(...)) for speed. They return values by setting
+#   well known variables: `val` (operand values), `cond` (condition codes),
+#   `displacement` (immediates and displacements), `modrm_*` (decoded operands).
+# * `rip` points to the first byte of the current instruction while it
+#   executes, `advance` is the number of bytes consumed so far. Branches
+#   modify `advance` so that `rip += advance` lands on the target.
 
 function unknown_insruction() {
 	declare instruction="$1"
@@ -857,118 +886,1054 @@ function unknown_insruction() {
 	die "Unknown instruction at 0x%x: ${instruction} (${msg})\n" $((rip))
 }
 
+# Unsigned 64-bit comparisons. Bash integers are signed, flipping the sign bit
+# turns an unsigned comparison into a signed one.
+function ult() {
+	(((($1) ^ INT64_MIN) < (($2) ^ INT64_MIN)))
+}
+
+function ule() {
+	(((($1) ^ INT64_MIN) <= (($2) ^ INT64_MIN)))
+}
+
+# Sets `val` to `value` (of `width` bytes) sign-extended to 64 bits.
+function sign_extend() {
+	declare -ri width="$1" value="$2"
+	case $((width)) in
+	1) ((val = ((value & 0xff) ^ 0x80) - 0x80)) || : ;;
+	2) ((val = ((value & 0xffff) ^ 0x8000) - 0x8000)) || : ;;
+	4) ((val = ((value & 0xffffffff) ^ 0x80000000) - 0x80000000)) || : ;;
+	*) ((val = value)) || : ;;
+	esac
+}
+
 # Modifies variables `displacement` and `advance`
+function disp64() {
+	declare -ri a=$((rip + advance))
+	((displacement = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 |
+		memory[a + 3] << 24 | memory[a + 4] << 32 | memory[a + 5] << 40 |
+		memory[a + 6] << 48 | memory[a + 7] << 56)) || :
+	((advance += 8)) || :
+}
+
+# Modifies variables `displacement` and `advance`. Sign-extended.
 function disp32() {
-	declare -ri i0=$((memory[rip + advance]))
-	declare -ri i1=$((memory[rip + advance + 1]))
-	declare -ri i2=$((memory[rip + advance + 2]))
-	declare -ri i3=$((memory[rip + advance + 3]))
+	declare -ri a=$((rip + advance))
+	((displacement = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 | memory[a + 3] << 24)) || :
+	((displacement = (displacement ^ 0x80000000) - 0x80000000)) || :
 	((advance += 4)) || :
-	displacement=$(print_le32 $((i0)) $((i1)) $((i2)) $((i3)))
 }
 
-# Modifies variables `displacement` and `advance`
+# Modifies variables `displacement` and `advance`. Sign-extended.
 function disp16() {
-	declare -ri i0=$((memory[rip + advance]))
-	declare -ri i1=$((memory[rip + advance + 1]))
+	declare -ri a=$((rip + advance))
+	((displacement = ((memory[a] | memory[a + 1] << 8) ^ 0x8000) - 0x8000)) || :
 	((advance += 2)) || :
-	displacement=$(print_le16 $((i0)) $((i1)))
 }
 
-# Modifies variables `displacement` and `advance`
+# Modifies variables `displacement` and `advance`. Sign-extended.
 function disp8() {
-	declare -ri i0=$((memory[rip + advance]))
+	((displacement = (memory[rip + advance] ^ 0x80) - 0x80)) || :
 	((advance += 1)) || :
-	((displacement = i0)) || :
 }
 
 # Modifies variables `displacement` and `advance`
 function disp_width() {
 	declare -i width="$1"
 	case $((width)) in
-	$((WIDTH8)))
-		disp8
-		;;
-	$((WIDTH16)))
-		disp16
-		;;
-	$((WIDTH32)))
+	$((WIDTH8))) disp8 ;;
+	$((WIDTH16))) disp16 ;;
+	$((WIDTH32))) disp32 ;;
+	$((WIDTH64))) disp64 ;;
+	*) die "Invalid width for immediate value or displacement." ;;
+	esac
+}
+
+# Sets modrm_mod modrm_reg modrm_rm modrm_address.
+# Reads SIB and displacement bytes at rip + advance and updates `advance`.
+# `imm_size` is the number of immediate bytes that follow the modrm operand:
+# RIP-relative addresses are relative to the end of the instruction.
+function operands_modrm() {
+	declare -i modrm="$1"
+	declare -i imm_size="${2:-0}"
+	declare -i displacement=0 sib base index
+	((modrm_mod = modrm >> 6 & 0x3)) || :
+	((modrm_reg = (modrm >> 3) & 0x7 | rex_r << 3)) || :
+	((modrm_rm = (modrm) & 0x7 | rex_b << 3)) || :
+	modrm_address=0
+
+	if ((modrm_mod == 3)); then
+		return 0
+	fi
+
+	if (((modrm & 0x7) == 4)); then
+		# SIB byte
+		((sib = memory[rip + advance])) || :
+		((advance++)) || :
+		((index = (sib >> 3) & 0x7 | rex_x << 3)) || :
+		((base = sib & 0x7 | rex_b << 3)) || :
+		if (((sib & 0x7) == 5 && modrm_mod == 0)); then
+			# No base register, disp32 only.
+			disp32
+			((modrm_address = displacement)) || :
+		else
+			((modrm_address = registers[base])) || :
+		fi
+		# index 4 (rsp) means no index. r12 (with REX.X) is a valid index.
+		if ((index != RSP)); then
+			((modrm_address += registers[index] << (sib >> 6 & 0x3))) || :
+		fi
+	elif (((modrm & 0x7) == 5 && modrm_mod == 0)); then
+		# RIP addressing, relative to the address of the next instruction.
 		disp32
+		((modrm_address = rip + advance + imm_size + displacement)) || :
+		return 0
+	else
+		((modrm_address = registers[modrm_rm])) || :
+	fi
+
+	case $((modrm_mod)) in
+	1)
+		disp8
+		((modrm_address += displacement)) || :
 		;;
-	*)
-		# I've never seen a 64 bit immediate value or displacement.
-		# Yolo. Assume it does not exist.
-		die "Invalid width for immediate value or displacement."
+	2)
+		disp32
+		((modrm_address += displacement)) || :
 		;;
 	esac
 }
 
-# Sets modrm_mod modrm_rm modrm_reg modrm_address
-function operands_modrm() {
-	declare -i modrm="$1"
-	modrm_mod=$((modrm >> 6 & 0x3))
-	modrm_reg=$(((modrm >> 3) & 0x7 | rex_b << 3))
-	modrm_rm=$(((modrm) & 0x7 | rex_r << 3))
-	modrm_address=0
-
-	case $((modrm_mod)) in
-	0)
-		case $((modrm_rm)) in
-		$((RSP)))
-			die "Unimplemented modrm: SIB"
-			;;
-		$((R13)))
-			die "Unimplemented modrm: SIB"
-			;;
-		$((RBP)))
-			declare -i displacement
-			disp32
-			# RIP addressing, we add the displacement to rip *after* the current instruction.
-			# disp32 already modified `advance`, so adding advance should point to the next
-			# instruction.
-			modrm_address=$((rip + displacement + advance))
-			;;
-		*)
-			modrm_address=$((registers[modrm_rm]))
-			;;
-		esac
-		;;
+# Sets `val` to the zero-extended value of register `reg` of `width` bytes.
+# Byte registers 4-7 are AH, CH, DH, BH unless a REX prefix is present.
+function read_reg() {
+	declare -ri width="$1" reg="$2"
+	case $((width)) in
 	1)
-		case $((modrm_rm)) in
-		$((RSP)))
-			die "Unimplemented modrm: SIB"
-			;;
-		$((R13)))
-			die "Unimplemented modrm: SIB"
-			;;
-		*)
-			declare -i displacement
-			disp8
-			modrm_address=$((registers[modrm_rm] + displacement))
-			;;
-		esac
+		if ((reg >= 4 && reg < 8 && !rex)); then
+			((val = (registers[reg - 4] >> 8) & 0xff)) || :
+		else
+			((val = registers[reg] & 0xff)) || :
+		fi
 		;;
-	2)
-		case $((modrm_rm)) in
-		$((RSP)))
-			die "Unimplemented modrm: SIB"
-			;;
-		$((R13)))
-			die "Unimplemented modrm: SIB"
-			;;
-		*)
-			declare -i displacement
-			disp32
-			modrm_address=$((registers[modrm_rm] + displacement))
-			;;
-		esac
-		;;
-	3) ;;
+	2) ((val = registers[reg] & 0xffff)) || : ;;
+	4) ((val = registers[reg] & 0xffffffff)) || : ;;
+	8) ((val = registers[reg])) || : ;;
+	*) die "Unsupported data width in read_reg: ${width}" ;;
+	esac
+}
 
-	*)
-		die "Internal error, invalid modrm: 0x%x" $((modrm))
+# Writes register `reg`. 32-bit writes zero the upper half of the register,
+# 8 and 16-bit writes preserve the other bits.
+function write_reg() {
+	declare -ri width="$1" reg="$2" value="$3"
+	case $((width)) in
+	1)
+		if ((reg >= 4 && reg < 8 && !rex)); then
+			((registers[reg - 4] = registers[reg - 4] & ~0xff00 | (value & 0xff) << 8)) || :
+		else
+			((registers[reg] = registers[reg] & ~0xff | (value & 0xff))) || :
+		fi
+		;;
+	2) ((registers[reg] = registers[reg] & ~0xffff | (value & 0xffff))) || : ;;
+	4) ((registers[reg] = value & 0xffffffff)) || : ;;
+	8) ((registers[reg] = value)) || : ;;
+	*) die "Unsupported data width in write_reg: ${width}" ;;
+	esac
+}
+
+# Sets `val` to the little endian value of `width` bytes at `address`.
+function read_mem() {
+	declare -ri width="$1" a="$2"
+	case $((width)) in
+	1) ((val = memory[a])) || : ;;
+	2) ((val = memory[a] | memory[a + 1] << 8)) || : ;;
+	4) ((val = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 | memory[a + 3] << 24)) || : ;;
+	8)
+		((val = memory[a] | memory[a + 1] << 8 | memory[a + 2] << 16 |
+			memory[a + 3] << 24 | memory[a + 4] << 32 | memory[a + 5] << 40 |
+			memory[a + 6] << 48 | memory[a + 7] << 56)) || :
+		;;
+	*) die "Unsupported data width in read_mem: ${width}" ;;
+	esac
+}
+
+function write_mem() {
+	declare -ri width="$1" a="$2" value="$3"
+	declare -i i
+	for ((i = 0; i < width; i++)); do
+		((memory[a + i] = (value >> (8 * i)) & 0xff)) || :
+	done
+}
+
+# Read/write the r/m operand decoded by operands_modrm.
+function read_rm() {
+	if ((modrm_mod == 3)); then
+		read_reg "$1" $((modrm_rm))
+	else
+		read_mem "$1" $((modrm_address))
+	fi
+}
+
+function write_rm() {
+	if ((modrm_mod == 3)); then
+		write_reg "$1" $((modrm_rm)) "$2"
+	else
+		write_mem "$1" $((modrm_address)) "$2"
+	fi
+}
+
+function push64() {
+	((registers[RSP] -= 8)) || :
+	write_mem 8 $((registers[RSP])) "$1"
+}
+
+# Sets `val`
+function pop64() {
+	read_mem 8 $((registers[RSP]))
+	((registers[RSP] += 8)) || :
+}
+
+### Flags ###
+
+# Sets ZF, SF and PF from `result` of `width` bytes.
+function set_result_flags() {
+	declare -ri width="$1" result="$2"
+	((flag_zf = result == 0)) || :
+	((flag_sf = result >> (width * 8 - 1) & 1)) || :
+	((flag_pf = parity_table[result & 0xff])) || :
+}
+
+# Returns RFLAGS as an integer.
+function get_rflags() {
+	echo $((flag_cf | flag_pf << 2 | flag_af << 4 | flag_zf << 6 | flag_sf << 7 |
+		flag_df << 10 | flag_of << 11 | 0x2))
+}
+
+# Sets `cond` to 1 when condition code `cc` (low nibble of jcc/setcc/cmovcc
+# opcodes) holds, 0 otherwise.
+function eval_cond() {
+	declare -ri cc="$1"
+	case $(((cc >> 1) & 7)) in
+	0) ((cond = flag_of)) || : ;;                        # o
+	1) ((cond = flag_cf)) || : ;;                        # b/c/nae
+	2) ((cond = flag_zf)) || : ;;                        # e/z
+	3) ((cond = flag_cf | flag_zf)) || : ;;              # be/na
+	4) ((cond = flag_sf)) || : ;;                        # s
+	5) ((cond = flag_pf)) || : ;;                        # p/pe
+	6) ((cond = flag_sf != flag_of)) || : ;;             # l/nge
+	7) ((cond = flag_zf | (flag_sf != flag_of))) || : ;; # le/ng
+	esac
+	((cond ^= cc & 1)) || :
+}
+
+# Arithmetic/logic operation number `op` as encoded in opcodes 00-3F and
+# group 1 (0=add 1=or 2=adc 3=sbb 4=and 5=sub 6=xor 7=cmp) on zero-extended
+# operands `a` and `b` of `width` bytes. Sets `val` and the flags.
+function alu() {
+	declare -ri op="$1" width="$2" a="$3" b="$4"
+	declare -i r mask sbit carry=0
+	((mask = width == 8 ? -1 : (1 << (width * 8)) - 1)) || :
+	((sbit = width * 8 - 1)) || :
+	case $((op)) in
+	0 | 2)
+		if ((op == 2)); then ((carry = flag_cf)) || :; fi
+		((r = (a + b + carry) & mask)) || :
+		if ((carry)); then
+			((flag_cf = (r ^ INT64_MIN) <= (a ^ INT64_MIN))) || :
+		else
+			((flag_cf = (r ^ INT64_MIN) < (a ^ INT64_MIN))) || :
+		fi
+		((flag_of = ((a ^ r) & (b ^ r)) >> sbit & 1)) || :
+		;;
+	3 | 5 | 7)
+		if ((op == 3)); then ((carry = flag_cf)) || :; fi
+		((r = (a - b - carry) & mask)) || :
+		if ((carry)); then
+			((flag_cf = (a ^ INT64_MIN) <= (b ^ INT64_MIN))) || :
+		else
+			((flag_cf = (a ^ INT64_MIN) < (b ^ INT64_MIN))) || :
+		fi
+		((flag_of = ((a ^ b) & (a ^ r)) >> sbit & 1)) || :
+		;;
+	1) ((r = a | b, flag_cf = 0, flag_of = 0)) || : ;;
+	4) ((r = a & b, flag_cf = 0, flag_of = 0)) || : ;;
+	6) ((r = (a ^ b) & mask, flag_cf = 0, flag_of = 0)) || : ;;
+	esac
+	((flag_af = ((a ^ b ^ r) >> 4) & 1)) || :
+	set_result_flags $((width)) $((r))
+	((val = r)) || :
+}
+
+# Shift/rotate operation number `op` as encoded in group 2 (0=rol 1=ror
+# 2=rcl 3=rcr 4=shl 5=shr 6=sal 7=sar) of `a` by `count`. Sets `val` and flags.
+function shift_op() {
+	declare -ri op="$1" width="$2" a="$3"
+	declare -i count="$4"
+	declare -i r=0 mask bits n s i msb
+	((bits = width * 8)) || :
+	((mask = width == 8 ? -1 : (1 << bits) - 1)) || :
+	((count &= width == 8 ? 0x3f : 0x1f)) || :
+	if ((count == 0)); then
+		((val = a)) || :
+		return 0
+	fi
+	case $((op)) in
+	0) # rol
+		((n = count % bits)) || :
+		if ((n == 0)); then
+			((r = a)) || :
+		else
+			((r = (a << n | (a >> (bits - n)) & ~(-1 << n)) & mask)) || :
+		fi
+		((flag_cf = r & 1)) || :
+		((flag_of = (r >> (bits - 1) & 1) ^ flag_cf)) || :
+		;;
+	1) # ror
+		((n = count % bits)) || :
+		if ((n == 0)); then
+			((r = a)) || :
+		else
+			((r = ((a >> n) & ~(-1 << (bits - n)) | a << (bits - n)) & mask)) || :
+		fi
+		((flag_cf = r >> (bits - 1) & 1)) || :
+		((flag_of = flag_cf ^ (r >> (bits - 2) & 1))) || :
+		;;
+	2 | 3) # rcl, rcr: one bit at a time, through the carry flag.
+		if ((width < 4)); then ((count %= bits + 1)) || :; fi
+		((r = a)) || :
+		for ((i = 0; i < count; i++)); do
+			if ((op == 2)); then
+				((msb = r >> (bits - 1) & 1)) || :
+				((r = (r << 1 | flag_cf) & mask)) || :
+				((flag_cf = msb)) || :
+			else
+				((msb = r & 1)) || :
+				((r = ((r >> 1) & ~(-1 << (bits - 1)) | flag_cf << (bits - 1)) & mask)) || :
+				((flag_cf = msb)) || :
+			fi
+		done
+		((flag_of = (r >> (bits - 1) & 1) ^ (op == 2 ? flag_cf : (r >> (bits - 2) & 1)))) || :
+		;;
+	4 | 6) # shl/sal
+		if ((count > bits)); then
+			((r = 0, flag_cf = 0)) || :
+		else
+			((r = (count == 64 ? 0 : a << count) & mask)) || :
+			((flag_cf = (a >> (bits - count)) & 1)) || :
+		fi
+		((flag_of = (r >> (bits - 1) & 1) ^ flag_cf)) || :
+		set_result_flags $((width)) $((r))
+		;;
+	5) # shr
+		((r = (a >> count) & ~(-1 << (64 - count)) & mask)) || :
+		((flag_cf = (a >> (count - 1)) & 1)) || :
+		((flag_of = a >> (bits - 1) & 1)) || :
+		set_result_flags $((width)) $((r))
+		;;
+	7) # sar
+		sign_extend $((width)) $((a))
+		((s = val)) || :
+		((r = (s >> count) & mask)) || :
+		((flag_cf = (s >> (count - 1)) & 1)) || :
+		((flag_of = 0)) || :
+		set_result_flags $((width)) $((r))
 		;;
 	esac
+	((val = r)) || :
+}
+
+# shld (left=1) / shrd (left=0) of `dest` by `count`, shifting in bits from
+# `src`. Sets `val` and flags.
+function double_shift() {
+	declare -ri left="$1" width="$2" dest="$3" src="$4"
+	declare -i count="$5" bits mask r
+	((bits = width * 8)) || :
+	((mask = width == 8 ? -1 : (1 << bits) - 1)) || :
+	((count &= width == 8 ? 0x3f : 0x1f)) || :
+	if ((count == 0)); then
+		((val = dest)) || :
+		return 0
+	fi
+	if ((count > bits)); then
+		# Undefined result (16-bit operands only); keep it simple.
+		((count = bits)) || :
+	fi
+	if ((left)); then
+		((r = ((count == 64 ? 0 : dest << count) | (src >> (bits - count)) & ~(-1 << count)) & mask)) || :
+		((flag_cf = (dest >> (bits - count)) & 1)) || :
+	else
+		((r = ((dest >> count) & ~(-1 << (64 - count)) | (count == 64 ? 0 : src << (bits - count))) & mask)) || :
+		((flag_cf = (dest >> (count - 1)) & 1)) || :
+	fi
+	((flag_of = ((r ^ dest) >> (bits - 1)) & 1)) || :
+	set_result_flags $((width)) $((r))
+	((val = r)) || :
+}
+
+# Full unsigned 64x64 -> 128 bit multiplication. Sets `prod_lo` and `prod_hi`.
+function mul64u() {
+	declare -ri a="$1" b="$2"
+	declare -ri m32=0xffffffff
+	declare -i al ah bl bh ll lh hl hh mid
+	((al = a & m32, ah = (a >> 32) & m32, bl = b & m32, bh = (b >> 32) & m32)) || :
+	((ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh)) || :
+	((mid = ((ll >> 32) & m32) + (lh & m32) + (hl & m32))) || :
+	((prod_lo = (ll & m32) | mid << 32)) || :
+	((prod_hi = hh + ((lh >> 32) & m32) + ((hl >> 32) & m32) + ((mid >> 32) & m32))) || :
+}
+
+# Signed multiplication of `a` and `b` of `width` bytes. Sets `prod_lo` (the
+# truncated result, zero-extended), `prod_hi` (the upper half) and CF/OF when
+# the result does not fit in `width` bytes.
+function imul_op() {
+	declare -ri width="$1"
+	declare -i a b r mask
+	sign_extend $((width)) "$2"
+	((a = val)) || :
+	sign_extend $((width)) "$3"
+	((b = val)) || :
+	if ((width == 8)); then
+		mul64u $((a)) $((b))
+		((prod_hi -= (a < 0 ? b : 0) + (b < 0 ? a : 0))) || :
+		((flag_cf = prod_hi != (prod_lo >> 63))) || :
+	else
+		((mask = (1 << (width * 8)) - 1)) || :
+		((r = a * b)) || :
+		((prod_lo = r & mask, prod_hi = (r >> (width * 8)) & mask)) || :
+		sign_extend $((width)) $((prod_lo))
+		((flag_cf = val != r)) || :
+	fi
+	((flag_of = flag_cf)) || :
+	set_result_flags $((width)) $((prod_lo))
+}
+
+# Unsigned division of the 128 bit value hi:lo by `d`, requires hi < d
+# (unsigned). Sets `quotient` and `remainder`.
+function udiv128() {
+	declare -i rem="$1"
+	declare -ri lo="$2" d="$3"
+	declare -i q=0 i top
+	for ((i = 63; i >= 0; i--)); do
+		((top = rem < 0)) || :
+		((rem = rem << 1 | ((lo >> i) & 1))) || :
+		((q <<= 1)) || :
+		if ((top || (rem ^ INT64_MIN) >= (d ^ INT64_MIN))); then
+			((rem -= d, q |= 1)) || :
+		fi
+	done
+	((quotient = q, remainder = rem)) || :
+}
+
+function divide_error() {
+	die "Divide error (#DE) at 0x%x" $((rip))
+}
+
+# mul/imul/div/idiv with implicit rAX/rDX operands (group 3 /4 - /7).
+function inst_muldiv() {
+	declare -ri op="$1" width="$2" src="$3"
+	declare -i a n d q r hi lo neg quotient remainder prod_lo prod_hi
+	case $((op)) in
+	4) # mul
+		read_reg $((width)) $((RAX))
+		((a = val)) || :
+		case $((width)) in
+		1)
+			((r = a * src)) || :
+			write_reg 2 $((RAX)) $((r))
+			((flag_cf = r >> 8 != 0)) || :
+			((prod_lo = r & 0xff)) || :
+			;;
+		2 | 4)
+			((r = a * src)) || :
+			((prod_lo = r & ((1 << (width * 8)) - 1))) || :
+			((prod_hi = (r >> (width * 8)) & ((1 << (width * 8)) - 1))) || :
+			write_reg $((width)) $((RAX)) $((prod_lo))
+			write_reg $((width)) $((RDX)) $((prod_hi))
+			((flag_cf = prod_hi != 0)) || :
+			;;
+		8)
+			mul64u $((a)) $((src))
+			write_reg 8 $((RAX)) $((prod_lo))
+			write_reg 8 $((RDX)) $((prod_hi))
+			((flag_cf = prod_hi != 0)) || :
+			;;
+		esac
+		((flag_of = flag_cf)) || :
+		set_result_flags $((width)) $((prod_lo))
+		;;
+	5) # imul
+		read_reg $((width)) $((RAX))
+		imul_op $((width)) $((val)) $((src))
+		if ((width == 1)); then
+			write_reg 2 $((RAX)) $((prod_hi << 8 | prod_lo))
+		else
+			write_reg $((width)) $((RAX)) $((prod_lo))
+			write_reg $((width)) $((RDX)) $((prod_hi))
+		fi
+		;;
+	6) # div
+		((src == 0)) && divide_error
+		case $((width)) in
+		1)
+			read_reg 2 $((RAX))
+			((q = val / src, r = val % src)) || :
+			((q > 0xff)) && divide_error
+			write_reg 2 $((RAX)) $((r << 8 | q))
+			;;
+		2 | 4)
+			read_reg $((width)) $((RDX))
+			((n = val << (width * 8))) || :
+			read_reg $((width)) $((RAX))
+			((n |= val)) || :
+			if ((n >= 0)); then
+				((q = n / src, r = n % src)) || :
+			else
+				udiv128 0 $((n)) $((src))
+				((q = quotient, r = remainder)) || :
+			fi
+			((q >> (width * 8))) && divide_error
+			write_reg $((width)) $((RAX)) $((q))
+			write_reg $((width)) $((RDX)) $((r))
+			;;
+		8)
+			((hi = registers[RDX], lo = registers[RAX])) || :
+			ule $((src)) $((hi)) && divide_error
+			if ((hi == 0 && lo >= 0 && src > 0)); then
+				((q = lo / src, r = lo % src)) || :
+			else
+				udiv128 $((hi)) $((lo)) $((src))
+				((q = quotient, r = remainder)) || :
+			fi
+			write_reg 8 $((RAX)) $((q))
+			write_reg 8 $((RDX)) $((r))
+			;;
+		esac
+		;;
+	7) # idiv
+		sign_extend $((width)) $((src))
+		((d = val)) || :
+		((d == 0)) && divide_error
+		case $((width)) in
+		1 | 2 | 4)
+			if ((width == 1)); then
+				read_reg 2 $((RAX))
+				sign_extend 2 $((val))
+				((n = val)) || :
+			else
+				read_reg $((width)) $((RDX))
+				((n = val << (width * 8))) || :
+				read_reg $((width)) $((RAX))
+				sign_extend $((width * 2)) $((n | val))
+				((n = val)) || :
+			fi
+			((q = n / d, r = n % d)) || :
+			sign_extend $((width)) $((q))
+			((val != q || (n == INT64_MIN && d == -1))) && divide_error
+			if ((width == 1)); then
+				write_reg 2 $((RAX)) $(((r & 0xff) << 8 | (q & 0xff)))
+			else
+				write_reg $((width)) $((RAX)) $((q))
+				write_reg $((width)) $((RDX)) $((r))
+			fi
+			;;
+		8)
+			((hi = registers[RDX], lo = registers[RAX])) || :
+			if ((hi == lo >> 63)); then
+				((lo == INT64_MIN && d == -1)) && divide_error
+				((q = lo / d, r = lo % d)) || :
+			else
+				# 128 bit signed dividend: divide magnitudes.
+				((neg = hi < 0)) || :
+				if ((neg)); then
+					((hi = ~hi + (lo == 0), lo = -lo)) || :
+				fi
+				((n = d < 0 ? -d : d)) || :
+				ule $((n)) $((hi)) && divide_error
+				udiv128 $((hi)) $((lo)) $((n))
+				((q = quotient, r = remainder)) || :
+				if ((neg ^ (d < 0))); then
+					ult $((INT64_MIN)) $((q)) && divide_error
+					((q = -q)) || :
+				else
+					((q < 0)) && divide_error
+				fi
+				if ((neg)); then ((r = -r)) || :; fi
+			fi
+			write_reg 8 $((RAX)) $((q))
+			write_reg 8 $((RDX)) $((r))
+			;;
+		esac
+		;;
+	esac
+	return 0
+}
+
+# Instructions with a modrm operand and a register operand (00-3B families,
+# 84/85 test). The operation is encoded in the opcode.
+function inst_binary_op() {
+	declare -ri binary_instruction="$1"
+	declare -ri modrm="$2"
+	declare -ri direction=$(((binary_instruction >> 1) & 0x1))
+	declare -ri width_is_byte=$((~binary_instruction & 0x1))
+	declare -i op=$(((binary_instruction >> 3) & 0x7))
+	declare -i width a b
+	((width = width_is_byte ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
+
+	declare -i modrm_mod modrm_reg modrm_rm modrm_address
+	operands_modrm $((modrm))
+
+	read_rm $((width))
+	((a = val)) || :
+	read_reg $((width)) $((modrm_reg))
+	((b = val)) || :
+	if (((binary_instruction & 0xfe) == 0x84)); then
+		alu 4 $((width)) $((a)) $((b)) # test
+		return 0
+	fi
+	if ((direction)); then
+		alu $((op)) $((width)) $((b)) $((a))
+		((op == 7)) || write_reg $((width)) $((modrm_reg)) $((val))
+	else
+		alu $((op)) $((width)) $((a)) $((b))
+		((op == 7)) || write_rm $((width)) $((val))
+	fi
+	return 0
+}
+
+# 88-8B
+function inst_mov() {
+	declare -ri mov="$1"
+	declare -ri modrm="$2"
+	declare -ri direction=$(((mov >> 1) & 0x1))
+	declare -ri width_is_byte=$((~mov & 0x1))
+	declare -i width
+	((width = width_is_byte ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
+
+	declare -i modrm_mod modrm_reg modrm_rm modrm_address
+	operands_modrm $((modrm))
+
+	if ((direction)); then
+		read_rm $((width))
+		write_reg $((width)) $((modrm_reg)) $((val))
+	else
+		read_reg $((width)) $((modrm_reg))
+		write_rm $((width)) $((val))
+	fi
+}
+
+function inst_lea() {
+	declare -i lea="$1"
+	declare -i modrm="$2"
+	declare -i modrm_mod modrm_reg modrm_rm modrm_address
+	operands_modrm $((modrm))
+	write_reg $((rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) $((modrm_reg)) $((modrm_address))
+}
+
+# B0-BF. B8-BF with REX.W is movabs with a 64-bit immediate.
+function inst_mov_imm() {
+	declare -ri mov="$1"
+	declare -ri reg=$((mov & 0x7 | rex_b << 3))
+	declare -i width displacement
+	((width = mov < 0xb8 ? WIDTH8 : rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
+	disp_width $((width))
+	write_reg $((width)) $((reg)) $((displacement))
+}
+
+function inst_push() {
+	declare -i reg="$1"
+	push64 $((registers[reg]))
+}
+
+# Executes the instruction at `rip` and moves `rip` to the next instruction.
+function step() {
+	declare -i op op2 modrm width imm_bytes a b displacement rep_prefix=0
+	declare -i modrm_mod modrm_reg modrm_rm modrm_address
+	rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
+	advance=0
+
+	# Prefixes
+	while true; do
+		((op = memory[rip + advance])) || :
+		((advance++)) || :
+		if (((op & 0xf0) == 0x40)); then
+			((rex = op, rex_w = op >> 3 & 1, rex_r = op >> 2 & 1, rex_x = op >> 1 & 1, rex_b = op & 1)) || :
+			continue
+		fi
+		case $((op)) in
+		$((0x66))) operand_size_prefix=1 ;;
+		$((0xf2)) | $((0xf3))) rep_prefix=$((op)) ;;
+		# cs, ds, es, ss segment overrides are no-ops in 64-bit mode. lock is
+		# irrelevant to a single threaded emulator.
+		$((0x2e)) | $((0x3e)) | $((0x26)) | $((0x36)) | $((0xf0))) ;;
+		*) break ;;
+		esac
+		# A legacy prefix after REX cancels REX.
+		rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0
+	done
+
+	if [[ ${enable_debug_messages} = true ]]; then
+		debug "rip=0x%x opcode=0x%02x" $((rip)) $((op))
+	fi
+
+	((width = rex_w ? WIDTH64 : operand_size_prefix ? WIDTH16 : WIDTH32)) || :
+
+	# add/or/adc/sbb/and/sub/xor/cmp: 00-05, 08-0D, ... 38-3D
+	if ((op < 0x40 && (op & 0x7) < 6)); then
+		if (((op & 0x7) < 4)); then
+			((modrm = memory[rip + advance], advance++)) || :
+			inst_binary_op $((op)) $((modrm))
+		else
+			# AL/eAX, imm
+			(((op & 1) == 0)) && width=1
+			disp_width $((width == 8 ? 4 : width))
+			read_reg $((width)) $((RAX))
+			alu $((op >> 3)) $((width)) $((val)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
+			(((op >> 3) == 7)) || write_reg $((width)) $((RAX)) $((val))
+		fi
+		((rip += advance)) || :
+		return 0
+	fi
+
+	case $((op)) in
+	$((0x0f)))
+		((op2 = memory[rip + advance], advance++)) || :
+		case $((op2 & 0xf0)) in
+		$((0x40))) # cmovcc
+			((modrm = memory[rip + advance], advance++)) || :
+			operands_modrm $((modrm))
+			read_rm $((width))
+			eval_cond $((op2))
+			if ((cond)); then
+				write_reg $((width)) $((modrm_reg)) $((val))
+			elif ((width == 4)); then
+				# Upper bits are cleared even if the condition is false.
+				read_reg 4 $((modrm_reg))
+				write_reg 4 $((modrm_reg)) $((val))
+			fi
+			;;
+		$((0x80))) # jcc rel32
+			disp32
+			eval_cond $((op2))
+			if ((cond)); then ((advance += displacement)) || :; fi
+			;;
+		$((0x90))) # setcc
+			((modrm = memory[rip + advance], advance++)) || :
+			operands_modrm $((modrm))
+			eval_cond $((op2))
+			write_rm 1 $((cond))
+			;;
+		*)
+			case $((op2)) in
+			$((0x05)))
+				inst_syscall
+				;;
+			$((0x18)) | $((0x19)) | $((0x1a)) | $((0x1b)) | $((0x1c)) | $((0x1d)) | $((0x1e)) | $((0x1f)))
+				# Hint nops: nopw/nopl, prefetch, endbr64 (f3 0f 1e fa)...
+				((modrm = memory[rip + advance], advance++)) || :
+				operands_modrm $((modrm))
+				;;
+			$((0xaf))) # imul r, r/m
+				((modrm = memory[rip + advance], advance++)) || :
+				operands_modrm $((modrm))
+				read_rm $((width))
+				((a = val)) || :
+				read_reg $((width)) $((modrm_reg))
+				imul_op $((width)) $((val)) $((a))
+				write_reg $((width)) $((modrm_reg)) $((prod_lo))
+				;;
+			$((0xa4)) | $((0xa5)) | $((0xac)) | $((0xad))) # shld, shrd
+				((modrm = memory[rip + advance], advance++)) || :
+				operands_modrm $((modrm)) $((op2 & 1 ? 0 : 1))
+				read_rm $((width))
+				((a = val)) || :
+				if ((op2 & 1)); then
+					((b = registers[RCX])) || :
+				else
+					disp8
+					((b = displacement)) || :
+				fi
+				read_reg $((width)) $((modrm_reg))
+				double_shift $((op2 < 0xac)) $((width)) $((a)) $((val)) $((b))
+				write_rm $((width)) $((val))
+				;;
+			$((0xbc)) | $((0xbd))) # bsf, bsr
+				((modrm = memory[rip + advance], advance++)) || :
+				operands_modrm $((modrm))
+				read_rm $((width))
+				if ((val == 0)); then
+					flag_zf=1
+				else
+					flag_zf=0
+					if ((op2 == 0xbc)); then
+						for ((b = 0; !((val >> b) & 1); b++)); do :; done
+					else
+						for ((b = width * 8 - 1; !((val >> b) & 1); b--)); do :; done
+					fi
+					write_reg $((width)) $((modrm_reg)) $((b))
+				fi
+				;;
+			$((0xb6)) | $((0xb7)) | $((0xbe)) | $((0xbf))) # movzx, movsx
+				((modrm = memory[rip + advance], advance++)) || :
+				operands_modrm $((modrm))
+				read_rm $(((op2 & 1) + 1))
+				if ((op2 & 0x8)); then
+					sign_extend $(((op2 & 1) + 1)) $((val))
+				fi
+				write_reg $((width)) $((modrm_reg)) $((val))
+				;;
+			*)
+				unknown_insruction "$(printf '0f %02x' $((op2)))" "unsupported 2 byte instruction"
+				;;
+			esac
+			;;
+		esac
+		;;
+	$((0x50)) | $((0x51)) | $((0x52)) | $((0x53)) | $((0x54)) | $((0x55)) | $((0x56)) | $((0x57)))
+		inst_push $((op & 0x7 | rex_b << 3))
+		;;
+	$((0x58)) | $((0x59)) | $((0x5a)) | $((0x5b)) | $((0x5c)) | $((0x5d)) | $((0x5e)) | $((0x5f)))
+		pop64
+		write_reg 8 $((op & 0x7 | rex_b << 3)) $((val))
+		;;
+	$((0x63))) # movsxd
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm))
+		if ((rex_w)); then
+			read_rm 4
+			sign_extend 4 $((val))
+		else
+			read_rm $((width))
+		fi
+		write_reg $((width)) $((modrm_reg)) $((val))
+		;;
+	$((0x68)) | $((0x6a))) # push imm32/imm8
+		disp_width $((op == 0x68 ? 4 : 1))
+		push64 $((displacement))
+		;;
+	$((0x69)) | $((0x6b))) # imul r, r/m, imm
+		((imm_bytes = op == 0x6b ? 1 : $((width == 8 ? 4 : width)))) || :
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm)) $((imm_bytes))
+		read_rm $((width))
+		((a = val)) || :
+		disp_width $((imm_bytes))
+		imul_op $((width)) $((a)) $((displacement))
+		write_reg $((width)) $((modrm_reg)) $((prod_lo))
+		;;
+	$((0x70)) | $((0x71)) | $((0x72)) | $((0x73)) | $((0x74)) | $((0x75)) | $((0x76)) | $((0x77)) | \
+		$((0x78)) | $((0x79)) | $((0x7a)) | $((0x7b)) | $((0x7c)) | $((0x7d)) | $((0x7e)) | $((0x7f)))
+		disp8
+		eval_cond $((op))
+		if ((cond)); then ((advance += displacement)) || :; fi
+		;;
+	$((0x80)) | $((0x81)) | $((0x83))) # group 1: alu r/m, imm
+		((op == 0x80)) && width=1
+		((imm_bytes = op == 0x81 ? $((width == 8 ? 4 : width)) : 1)) || :
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm)) $((imm_bytes))
+		read_rm $((width))
+		((a = val)) || :
+		disp_width $((imm_bytes))
+		alu $((modrm >> 3 & 7)) $((width)) $((a)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
+		(((modrm >> 3 & 7) == 7)) || write_rm $((width)) $((val))
+		;;
+	$((0x84)) | $((0x85))) # test r/m, r
+		((modrm = memory[rip + advance], advance++)) || :
+		inst_binary_op $((op)) $((modrm))
+		;;
+	$((0x86)) | $((0x87))) # xchg r/m, r
+		((op == 0x86)) && width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm))
+		read_rm $((width))
+		((a = val)) || :
+		read_reg $((width)) $((modrm_reg))
+		write_rm $((width)) $((val))
+		write_reg $((width)) $((modrm_reg)) $((a))
+		;;
+	$((0x88)) | $((0x89)) | $((0x8a)) | $((0x8b)))
+		((modrm = memory[rip + advance], advance++)) || :
+		inst_mov $((op)) $((modrm))
+		;;
+	$((0x8d)))
+		((modrm = memory[rip + advance], advance++)) || :
+		inst_lea $((op)) $((modrm))
+		;;
+	$((0x8f))) # pop r/m64
+		((modrm = memory[rip + advance], advance++)) || :
+		pop64
+		((a = val)) || :
+		operands_modrm $((modrm))
+		write_rm 8 $((a))
+		;;
+	$((0x90)) | $((0x91)) | $((0x92)) | $((0x93)) | $((0x94)) | $((0x95)) | $((0x96)) | $((0x97)))
+		# xchg rAX, r. 0x90 without REX.B is nop (or pause with f3).
+		if (((op & 0x7 | rex_b << 3) != RAX)); then
+			read_reg $((width)) $((RAX))
+			((a = val)) || :
+			read_reg $((width)) $((op & 0x7 | rex_b << 3))
+			write_reg $((width)) $((RAX)) $((val))
+			write_reg $((width)) $((op & 0x7 | rex_b << 3)) $((a))
+		fi
+		;;
+	$((0x98))) # cbw, cwde, cdqe
+		read_reg $((width / 2)) $((RAX))
+		sign_extend $((width / 2)) $((val))
+		write_reg $((width)) $((RAX)) $((val))
+		;;
+	$((0x99))) # cwd, cdq, cqo
+		read_reg $((width)) $((RAX))
+		write_reg $((width)) $((RDX)) $(((val >> (width * 8 - 1) & 1) ? -1 : 0))
+		;;
+	$((0xa4)) | $((0xa5)) | $((0xaa)) | $((0xab))) # movs, stos
+		(((op & 1) == 0)) && width=1
+		while ((!rep_prefix || registers[RCX] != 0)); do
+			if ((op >= 0xaa)); then
+				read_reg $((width)) $((RAX))
+			else
+				read_mem $((width)) $((registers[RSI]))
+				((registers[RSI] += flag_df ? -width : width)) || :
+			fi
+			write_mem $((width)) $((registers[RDI])) $((val))
+			((registers[RDI] += flag_df ? -width : width)) || :
+			((rep_prefix)) || break
+			((registers[RCX]--)) || :
+		done
+		;;
+	$((0xa8)) | $((0xa9))) # test al/eAX, imm
+		((op == 0xa8)) && width=1
+		disp_width $((width == 8 ? 4 : width))
+		read_reg $((width)) $((RAX))
+		alu 4 $((width)) $((val)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
+		;;
+	$((0xb0)) | $((0xb1)) | $((0xb2)) | $((0xb3)) | $((0xb4)) | $((0xb5)) | $((0xb6)) | $((0xb7)) | \
+		$((0xb8)) | $((0xb9)) | $((0xba)) | $((0xbb)) | $((0xbc)) | $((0xbd)) | $((0xbe)) | $((0xbf)))
+		inst_mov_imm $((op))
+		;;
+	$((0xc0)) | $((0xc1)) | $((0xd0)) | $((0xd1)) | $((0xd2)) | $((0xd3))) # group 2: shifts
+		(((op & 1) == 0)) && width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm)) $((op < 0xd0 ? 1 : 0))
+		read_rm $((width))
+		((a = val)) || :
+		if ((op < 0xd0)); then
+			disp8
+			((b = displacement & 0xff)) || :
+		elif ((op < 0xd2)); then
+			b=1
+		else
+			((b = registers[RCX] & 0xff)) || :
+		fi
+		shift_op $((modrm >> 3 & 7)) $((width)) $((a)) $((b))
+		write_rm $((width)) $((val))
+		;;
+	$((0xc2)) | $((0xc3))) # ret, ret imm16
+		if ((op == 0xc2)); then
+			disp16
+			((b = displacement & 0xffff)) || :
+		else
+			b=0
+		fi
+		pop64
+		((registers[RSP] += b)) || :
+		((advance = val - rip)) || :
+		;;
+	$((0xc6)) | $((0xc7))) # mov r/m, imm
+		((op == 0xc6)) && width=1
+		((imm_bytes = op == 0xc6 ? 1 : $((width == 8 ? 4 : width)))) || :
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm)) $((imm_bytes))
+		disp_width $((imm_bytes))
+		write_rm $((width)) $((displacement))
+		;;
+	$((0xc9))) # leave
+		((registers[RSP] = registers[RBP])) || :
+		pop64
+		((registers[RBP] = val)) || :
+		;;
+	$((0xe8))) # call rel32
+		disp32
+		push64 $((rip + advance))
+		((advance += displacement)) || :
+		;;
+	$((0xe9))) # jmp rel32
+		disp32
+		((advance += displacement)) || :
+		;;
+	$((0xeb))) # jmp rel8
+		disp8
+		((advance += displacement)) || :
+		;;
+	$((0xf5))) ((flag_cf = !flag_cf)) || : ;; # cmc
+	$((0xf8))) flag_cf=0 ;;                     # clc
+	$((0xf9))) flag_cf=1 ;;                     # stc
+	$((0xfc))) flag_df=0 ;;                     # cld
+	$((0xfd))) flag_df=1 ;;                     # std
+	$((0xf6)) | $((0xf7))) # group 3
+		((op == 0xf6)) && width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		((imm_bytes = (modrm >> 3 & 7) < 2 ? $((width == 8 ? 4 : width)) : 0)) || :
+		operands_modrm $((modrm)) $((imm_bytes))
+		read_rm $((width))
+		((a = val)) || :
+		case $((modrm >> 3 & 7)) in
+		0 | 1) # test
+			disp_width $((imm_bytes))
+			alu 4 $((width)) $((a)) $((displacement & (width == 8 ? -1 : (1 << width * 8) - 1)))
+			;;
+		2) # not
+			write_rm $((width)) $((~a))
+			;;
+		3) # neg
+			alu 5 $((width)) 0 $((a))
+			write_rm $((width)) $((val))
+			;;
+		*)
+			inst_muldiv $((modrm >> 3 & 7)) $((width)) $((a))
+			;;
+		esac
+		;;
+	$((0xfe)) | $((0xff))) # group 4/5
+		((op == 0xfe)) && width=1
+		((modrm = memory[rip + advance], advance++)) || :
+		operands_modrm $((modrm))
+		case $((modrm >> 3 & 7)) in
+		0 | 1) # inc, dec: CF is preserved.
+			read_rm $((width))
+			((b = flag_cf)) || :
+			alu $(((modrm >> 3 & 7) ? 5 : 0)) $((width)) $((val)) 1
+			((flag_cf = b)) || :
+			write_rm $((width)) $((val))
+			;;
+		2) # call r/m64
+			((op == 0xff)) || unknown_insruction "fe /2" "invalid"
+			read_rm 8
+			((a = val)) || :
+			push64 $((rip + advance))
+			((advance = a - rip)) || :
+			;;
+		4) # jmp r/m64
+			((op == 0xff)) || unknown_insruction "fe /4" "invalid"
+			read_rm 8
+			((advance = val - rip)) || :
+			;;
+		6) # push r/m64
+			((op == 0xff)) || unknown_insruction "fe /6" "invalid"
+			read_rm 8
+			push64 $((val))
+			;;
+		*)
+			unknown_insruction "$(printf '%02x /%d' $((op)) $((modrm >> 3 & 7)))" "unsupported group 5 instruction"
+			;;
+		esac
+		;;
+	*)
+		unknown_insruction "$(printf '%02x' $((op)))" "unsupported instruction"
+		;;
+	esac
+
+	((rip += advance)) || :
 }
 
 function set_register() {
@@ -983,7 +1948,7 @@ function set_register() {
 		((registers[reg]=registers[reg] & (~0 << 16) | (value & 0xffff) )) || :
 		;;
 	4)
-		((registers[reg]=registers[reg] & (~0 << 32) | (value & 0xfffffff) )) || :
+		((registers[reg]=registers[reg] & (~0 << 32) | (value & 0xffffffff) )) || :
 		;;
 	8)
 		((registers[reg]=value)) || :
@@ -1052,95 +2017,6 @@ function get_width() {
 	else
 		echo $((WIDTH32))
 	fi
-}
-
-function inst_mov() {
-	declare -ri mov="$1"
-	declare -ri modrm="$2"
-	declare -ri direction=$(((mov >> 1) & 0x1))
-	declare -ri width_is_byte=$((~mov & 0x1))
-
-	declare -ri width=$((width_is_byte ? WIDTH8 : $(get_width)))
-
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-
-	case $((modrm_mod)) in
-	3)
-		if ((direction)); then
-			set_register $((width)) $((modrm_reg)) "$(get_register $((width)) $((modrm_rm)))"
-		else
-			set_register $((width)) $((modrm_rm)) "$(get_register $((width)) $((modrm_reg)))"
-		fi
-		;;
-	*)
-		if ((direction)); then
-			set_register $((width)) $((modrm_reg)) "$(get_memory $((width)) $((modrm_address)))"
-		else
-			set_memory $((width)) $((modrm_address)) "$(get_register $((width)) $((modrm_reg)))"
-		fi
-		;;
-	esac
-}
-
-function binary_op_xor() {
-	declare -ri operand0="$1"
-	declare -ri operand1="$2"
-	echo $((operand0 ^ operand1))
-}
-
-function inst_binary_op() {
-	declare -r binary_op="$1"
-	declare -ri binary_instruction="$2"
-	declare -ri modrm="$3"
-	declare -ri direction=$(((binary_instruction >> 1) & 0x1))
-	declare -ri width_is_byte=$((~binary_instruction & 0x1))
-
-	declare -ri width=$((width_is_byte ? WIDTH8 : $(get_width)))
-
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-
-	case $((modrm_mod)) in
-	3)
-		declare -ri operand0=$(get_register $((width)) $((modrm_rm)))
-		declare -ri operand1=$(get_register $((width)) $((modrm_reg)))
-		if ((direction)); then
-			declare -ri result=$("${binary_op}" "${operand0}" "${operand1}")
-			set_register $((width)) $((modrm_reg)) $((result))
-		else
-			declare -ri result=$("${binary_op}" "${operand1}" "${operand0}")
-			set_register $((width)) $((modrm_rm)) $((result))
-		fi
-		;;
-	*)
-		declare -ri operand0=$(get_register $((width)) $((modrm_reg)))
-		declare -ri operand1=$(get_memory $((width)) $((modrm_address)))
-		if ((direction)); then
-			declare -ri result=$("${binary_op}" "${operand0}" "${operand1}")
-			set_register $((width)) $((modrm_reg)) "$(get_memory $((width)) $((modrm_address)))"
-		else
-			declare -ri result=$("${binary_op}" "${operand1}" "${operand0}")
-			set_memory $((width)) $((modrm_address)) $((result))
-		fi
-		;;
-	esac
-}
-
-function inst_lea() {
-	declare -i lea="$1"
-	declare -i modrm="$2"
-	declare -i modrm_mod modrm_reg modrm_rm modrm_address
-	operands_modrm $((modrm))
-	set_register WIDTH64 $((modrm_reg)) $((modrm_address))
-}
-
-function inst_mov_imm() {
-	declare -ri mov="$1"
-	declare -ri reg=$((mov & 0x7 | rex_b << 3))
-	declare -i displacement
-	disp_width $((width))
-	set_register $((width)) $((reg)) $((displacement))
 }
 
 function inst_syscall() {
@@ -1544,106 +2420,13 @@ function run() {
 	declare -i rex=0 rex_w=0 rex_r=0 rex_x=0 rex_b=0 operand_size_prefix=0
 
 	while true; do
-		declare -i prefix_set=0
-		declare -i advance=1
-		declare -i instruction=$((memory[rip]))
-
-		case $((instruction & 0xF0)) in
-		$((0x30)))
-			if (((instruction & 0xF) < 5)); then
-				declare -i modrm=$((memory[rip + advance]))
-				((advance++)) || :
-				inst_binary_op binary_op_xor $((instruction)) $((modrm))
-			else
-				unknown_insruction "$(printf '%02x' $((instruction)))" "maybe a xor"
-			fi
-			;;
-		$((0x40)))
-			((rex = instruction)) || :
-			((rex_w = rex >> 3 & 0x1)) || :
-			((rex_r = rex >> 2 & 0x1)) || :
-			((rex_x = rex >> 1 & 0x1)) || :
-			((rex_b = rex & 0x1)) || :
-			((prefix_set = 1)) || :
-			;;
-		$((0x60)))
-			case $((instruction)) in
-			0x66)
-				operand_size_prefix=$((instruction))
-				;;
-			esac
-			;;
-		$((0x50)))
-			inst_push $((instruction & 0x0F))
-			;;
-		$((0x80)))
-			case $((instruction & 0xF)) in
-			$((0x9)))
-				declare -i modrm=${memory[$((rip + advance))]}
-				((advance++)) || :
-				inst_mov $((instruction)) $((modrm))
-				;;
-			$((0xd)))
-				declare -i modrm=${memory[$((rip + advance))]}
-				((advance++)) || :
-				inst_lea $((instruction)) $((modrm))
-				;;
-			*)
-				unknown_insruction "$(printf '%02x' $((instruction)))" "maybe a mov"
-				;;
-			esac
-			;;
-		$((0xb0)))
-			declare -i width
-			if ((instruction & 0xF < 8)); then
-				((width = WIDTH8)) || :
-			else
-				width=$(get_width)
-			fi
-			inst_mov_imm $((instruction))
-			;;
-		$((0)))
-			case $((instruction)) in
-			$((0x0f)))
-				declare -i instruction_byte_2=${memory[$((rip + advance))]}
-				((advance++)) || :
-				case $((instruction_byte_2)) in
-				$((0x05)))
-					inst_syscall
-					;;
-				*)
-					die "Unsupported 2 byte instruction: %02x%02x" \
-						$((instruction)) $((instruction_byte_2))
-					;;
-				esac
-				;;
-			esac
-			;;
-		*)
-			die "Unsupported instruction: 0x%x" $((instruction))
-			;;
-		esac
-
-		((rip += advance)) || :
-		((advance = 1)) || :
-
-		# Reset prefix variable unless we just set a prefix
-		if ((prefix_set)); then
-			((prefix_set = 0)) || :
-		else
-			rex=0
-			rex_w=0
-			rex_r=0
-			rex_x=0
-			rex_b=0
-			operand_size_prefix=0
-		fi
+		step
 	done
 }
 
 function init() {
 	typeset -i i
-	for ((i = 0; i < $((0xf)); i++)); do
+	for ((i = 0; i < 16; i++)); do
 		registers[$i]=0
 	done
 	registers[${RSP}]=$((0x10000))

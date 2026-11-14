@@ -52,8 +52,27 @@ The loader sets `GLOBAL_os_abi` to `macos` or `linux` so that the syscall emulat
 
 ## Supported instructions
 
-Currently, spleen supports only the instructions needed to run the single provide example.
-For reference, here is the program that `spleen.bash` can run:
+Spleen implements the integer subset of x86_64 typically emitted by a C compiler
+(`-O0`, `-O1`, `-Os`, no SSE/x87):
+
+* Arithmetic/logic: `add`, `or`, `adc`, `sbb`, `and`, `sub`, `xor`, `cmp` in all
+  their encodings (`00`-`3D`, `80`/`81`/`83`), `test`, `inc`, `dec`, `neg`, `not`,
+  `mul`, `imul` (1, 2 and 3 operands), `div`, `idiv` (including 128 bit dividends).
+* Shifts and rotates: `shl`/`sal`, `shr`, `sar`, `rol`, `ror`, `rcl`, `rcr`, `shld`, `shrd`.
+* Bit scan: `bsf`, `bsr`.
+* Data movement: `mov` (all forms, including `movabs`), `movzx`, `movsx`, `movsxd`,
+  `lea`, `push`, `pop`, `xchg`, `cbw`/`cwde`/`cdqe`, `cwd`/`cdq`/`cqo`, `cmovcc`, `setcc`,
+  `movs` and `stos` (with `rep`).
+* Control flow: `jmp` (rel8, rel32, indirect), `jcc` (rel8, rel32), `call` (rel32,
+  indirect), `ret`, `leave`.
+* Misc: `nop` (including multi-byte `0f 1f` forms), `endbr64`, `syscall`, `clc`, `stc`,
+  `cmc`, `cld`, `std`.
+* Flags: CF, PF, AF, ZF, SF, OF are computed (DF is honored by string instructions).
+* Addressing: all ModRM/SIB forms, RIP-relative addressing, REX prefixes, 8-bit
+  registers (`AH`-`BH` without REX, `SPL`-`DIL` with REX), operand size prefix.
+
+`run-tests.bash` contains unit tests for these instructions. For reference, here is
+the example program that `spleen.bash` runs:
 
 ```shell
 nohar@pro ~/projects/hate% objdump -d examples-bin/hi
