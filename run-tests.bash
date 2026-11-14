@@ -1061,6 +1061,422 @@ function test_nops_and_strings() {
 	check "mem" $(get_memory 4 $((0x9101))) 0x04050607
 }
 
+function check_xmm() {
+	check "XMM$1.lo" $((xmm_lo[$1])) "$2"
+	check "XMM$1.hi" $((xmm_hi[$1])) "$3"
+}
+
+function test_tls_and_addr32() {
+	current_test=tls_and_addr32
+	GLOBAL_fs_base=$((0x20000))
+	GLOBAL_gs_base=$((0x30000))
+
+	# 0x64 FS override BEFORE REX.W: mov %fs:0x28, %rax
+	set_memory 8 $((0x20028)) $((0xdeadbeefcafebabe))
+	set_regs RAX 0
+	exec_insn 64 48 8b 04 25 28 00 00 00
+	check_reg RAX $((0xdeadbeefcafebabe))
+
+	# Store and read-modify-write on %fs:0x30 (seg_base must be added once, not twice)
+	set_regs RAX 100
+	exec_insn 64 48 89 04 25 30 00 00 00 # mov %rax, %fs:0x30
+	check "fs:0x30" $(get_memory 8 $((0x20030))) 100
+	exec_insn 64 48 83 04 25 30 00 00 00 05 # addq $5, %fs:0x30
+	check "fs:0x30 after add" $(get_memory 8 $((0x20030))) 105
+
+	# %gs override: mov %gs:0x10, %ebx
+	set_memory 4 $((0x30010)) $((0x12345678))
+	set_regs RBX -1
+	exec_insn 65 8b 1c 25 10 00 00 00
+	check_reg RBX $((0x12345678))
+
+	# CRITICAL: lea ignores %fs: segment base!
+	set_regs RAX -1
+	exec_insn 64 48 8d 04 25 28 00 00 00 # lea %fs:0x28, %rax
+	check_reg RAX $((0x28))
+
+	# Legacy prefix AFTER REX cancels REX (32-bit load instead of 64-bit)
+	set_memory 8 $((0x20028)) $((0x1122334455667788))
+	set_regs RAX -1
+	exec_insn 48 64 8b 04 25 28 00 00 00
+	check_reg RAX $((0x55667788))
+
+	# 0x67 addr32 prefix: masks effective address to 32 bits BEFORE adding seg_base
+	set_memory 8 $((0x7500)) $((0xabcdef0123456789))
+	set_regs RAX $((0x100007500))
+	exec_insn 67 48 8b 00 # mov (%eax), %rax
+	check_reg RAX $((0xabcdef0123456789))
+
+	set_memory 4 $((0x20010)) $((0x55aa55aa))
+	set_regs RAX $((0x200000010))
+	exec_insn 67 64 8b 00 # mov %fs:(%eax), %eax
+	check_reg RAX $((0x55aa55aa))
+
+	# 0x67 lea (%eax), %rax
+	set_regs RAX $((0x300001234))
+	exec_insn 67 48 8d 00
+	check_reg RAX $((0x1234))
+
+	GLOBAL_fs_base=0
+	GLOBAL_gs_base=0
+}
+
+function test_system_and_atomic() {
+	current_test=system_and_atomic
+
+	# cpuid leaf 0 ("GenuineIntel") + upper 32-bit zeroing
+	set_regs RAX $((0x100000000)) RBX -1 RCX -1 RDX -1
+	exec_insn 0f a2
+	check_reg RAX 7
+	check_reg RBX $((0x756e6547))
+	check_reg RDX $((0x49656e69))
+	check_reg RCX $((0x6c65746e))
+
+	# cpuid leaf 1: SSE + SSE2 present, SSSE3/SSE4/AVX disabled
+	set_regs RAX 1 RCX 0
+	exec_insn 0f a2
+	check_reg RDX $((0x078bfbfd))
+	check "no AVX/SSE4" $((registers[RCX] & ~ (1 << 23))) 0
+
+	# cpuid leaf 7: BMI/AVX2/AVX512 disabled
+	set_regs RAX 7 RCX 0
+	exec_insn 0f a2
+	check_reg RBX 0
+	check_reg RCX 0
+	check_reg RDX 0
+
+	# cpuid leaf 0x80000001: LM + NX + SYSCALL + LAHF_LM
+	set_regs RAX $((0x80000001))
+	exec_insn 0f a2
+	check_reg RCX 1
+	check_reg RDX $(((1 << 29) | (1 << 20) | (1 << 11)))
+
+	# rdtsc / rdtscp / xgetbv
+	GLOBAL_tsc=$((0x200000000))
+	set_regs RAX -1 RDX -1
+	exec_insn 0f 31 # rdtsc
+	check_reg RAX 100
+	check_reg RDX 2
+
+	set_regs RAX -1 RDX -1 RCX -1
+	exec_insn 0f 01 f9 # rdtscp
+	check_reg RAX 200
+	check_reg RDX 2
+	check_reg RCX 0
+
+	set_regs RAX -1 RDX -1 RCX 0
+	exec_insn 0f 01 d0 # xgetbv
+	check_reg RAX 3
+	check_reg RDX 0
+
+	# cmpxchg: equal case (memory)
+	set_memory 8 $((0x9200)) 42
+	set_regs RAX 42 RCX 99 RDI $((0x9200))
+	exec_insn f0 48 0f b1 0f # lock cmpxchg %rcx, (%rdi)
+	check_flags "ZF=1"
+	check "cmpxchg mem eq" $(get_memory 8 $((0x9200))) 99
+	check_reg RAX 42
+
+	# cmpxchg: unequal 32-bit case zeroes upper 32 bits of RAX!
+	set_memory 4 $((0x9200)) $((0x87654321))
+	set_regs RAX $((0xdeadbeef00000001)) RCX 55 RDI $((0x9200))
+	exec_insn 0f b1 0f # cmpxchg %ecx, (%rdi)
+	check_flags "ZF=0"
+	check_reg RAX $((0x87654321))
+	check "cmpxchg mem neq" $(get_memory 4 $((0x9200))) $((0x87654321))
+
+	# xadd: memory + register, and same-register xadd %rax, %rax
+	set_memory 8 $((0x9200)) 10
+	set_regs RCX 25 RDI $((0x9200))
+	exec_insn f0 48 0f c1 0f # lock xadd %rcx, (%rdi)
+	check_reg RCX 10
+	check "xadd mem" $(get_memory 8 $((0x9200))) 35
+
+	set_regs RAX 21
+	exec_insn 48 0f c1 c0 # xadd %rax, %rax
+	check_reg RAX 42
+
+	# bswap 32-bit (zeroes upper 32 bits) and 64-bit
+	set_regs RAX $((0xffeeddcc11223344))
+	exec_insn 0f c8 # bswap %eax
+	check_reg RAX $((0x44332211))
+
+	set_regs R11 $((0x0102030405060708))
+	exec_insn 49 0f cb # bswap %r11
+	check_reg R11 $((0x0807060504030201))
+}
+
+function test_bit_ops() {
+	current_test=bit_ops
+
+	# Register bt / bts / btr / btc (64-bit)
+	set_regs RAX 0 RCX 40
+	exec_insn 48 0f ab c8 # bts %rcx, %rax
+	check_flags "CF=0"
+	check_reg RAX $((1 << 40))
+
+	exec_insn 48 0f a3 c8 # bt %rcx, %rax
+	check_flags "CF=1"
+
+	exec_insn 48 0f bb c8 # btc %rcx, %rax
+	check_flags "CF=1"
+	check_reg RAX 0
+
+	set_regs RAX $((1 << 63))
+	exec_insn 48 0f ba f0 3f # btr $63, %rax
+	check_flags "CF=1"
+	check_reg RAX 0
+
+	# Memory bt / bts / btr with positive AND negative bit offsets!
+	# Base at 0x9310: bit -1 is bit 31 of dword at 0x930c; bit -33 is bit 31 of dword at 0x9308;
+	# bit 35 is bit 3 of dword at 0x9314.
+	set_memory 8 $((0x9308)) 0
+	set_memory 8 $((0x9310)) 0
+	set_regs RDI $((0x9310)) RCX -1
+	exec_insn 0f ab 0f # bts %ecx, (%rdi)
+	check_flags "CF=0"
+	check "bts bit -1" $(get_memory 4 $((0x930c))) $((0x80000000))
+
+	set_regs RCX -33
+	exec_insn 0f ab 0f # bts %ecx, (%rdi)
+	check "bts bit -33" $(get_memory 4 $((0x9308))) $((0x80000000))
+	exec_insn 0f b3 0f # btr %ecx, (%rdi)
+	check_flags "CF=1"
+	check "btr bit -33" $(get_memory 4 $((0x9308))) 0
+
+	set_regs RCX 35
+	exec_insn 0f ab 0f # bts %ecx, (%rdi)
+	check "bts bit 35" $(get_memory 4 $((0x9314))) 8
+
+	# tzcnt / lzcnt / popcnt
+	set_regs RAX 0 RCX 99
+	exec_insn f3 48 0f bc c8 # tzcnt %rax, %rcx
+	check_reg RCX 64
+	check_flags "CF=1 ZF=0"
+
+	set_regs RAX 0 RCX 99
+	exec_insn f3 0f bd c8 # lzcnt %eax, %ecx
+	check_reg RCX 32
+	check_flags "CF=1 ZF=0"
+
+	set_regs RAX $((0x8000000000000100))
+	exec_insn f3 48 0f bc c8 # tzcnt %rax, %rcx
+	check_reg RCX 8
+	check_flags "CF=0 ZF=0"
+	exec_insn f3 48 0f bd c8 # lzcnt %rax, %rcx
+	check_reg RCX 0
+	check_flags "CF=0 ZF=1"
+
+	set_regs RAX 0
+	flag_cf=1 flag_of=1 flag_sf=1 flag_pf=1
+	exec_insn f3 48 0f b8 c8 # popcnt %rax, %rcx
+	check_reg RCX 0
+	check_flags "ZF=1 CF=0 OF=0 SF=0 PF=0"
+
+	set_regs RAX -1
+	exec_insn f3 48 0f b8 c8 # popcnt %rax, %rcx
+	check_reg RCX 64
+	check_flags "ZF=0 CF=0"
+}
+
+function test_strings_and_misc() {
+	current_test=strings_and_misc
+	flag_df=0
+
+	# repne scasb (strlen pattern)
+	put_bytes $((0x9400)) 'hello\0world'
+	set_regs RAX 0 RDI $((0x9400)) RCX 16
+	exec_insn f2 ae # repne scasb
+	check_flags "ZF=1"
+	check_reg RDI $((0x9406))
+	check_reg RCX 10
+
+	# repne scasb with RCX=0 does 0 iterations
+	flag_zf=0
+	set_regs RDI $((0x9400)) RCX 0
+	exec_insn f2 ae
+	check_reg RDI $((0x9400))
+	check_flags "ZF=0"
+
+	# repe cmpsb: mismatch at index 3 ('d' - 'x' < 0 -> CF=1, ZF=0)
+	put_bytes $((0x9420)) 'abcdef'
+	put_bytes $((0x9430)) 'abcxef'
+	set_regs RSI $((0x9420)) RDI $((0x9430)) RCX 6
+	exec_insn f3 a6 # repe cmpsb
+	check_flags "ZF=0 CF=1"
+	check_reg RSI $((0x9424))
+	check_reg RDI $((0x9434))
+	check_reg RCX 2
+
+	# lodsb + %fs: lodsq
+	GLOBAL_fs_base=$((0x9500))
+	set_memory 8 $((0x9508)) $((0x0123456789abcdef))
+	set_regs RSI 8 RAX 0
+	exec_insn 64 48 ad # lodsq %fs:(%rsi), %rax
+	check_reg RAX $((0x0123456789abcdef))
+	check_reg RSI 16
+
+	# mov moffs with %fs: override
+	exec_insn 64 48 a3 20 00 00 00 00 00 00 00 # movabs %rax, %fs:0x20
+	check "moffs store" $(get_memory 8 $((0x9520))) $((0x0123456789abcdef))
+	set_regs RAX 0
+	exec_insn 64 48 a1 20 00 00 00 00 00 00 00 # movabs %fs:0x20, %rax
+	check_reg RAX $((0x0123456789abcdef))
+	GLOBAL_fs_base=0
+
+	# pushfq / popfq & lahf / sahf
+	set_regs RSP $((0x8000))
+	flag_cf=1 flag_zf=1 flag_sf=0 flag_of=1 flag_df=0
+	exec_insn 9c # pushfq
+	flag_cf=0 flag_zf=0 flag_of=0
+	exec_insn 9d # popfq
+	check_flags "CF=1 ZF=1 SF=0 OF=1"
+
+	set_regs RAX 0
+	flag_cf=1 flag_zf=0 flag_sf=1 flag_pf=1 flag_af=0
+	exec_insn 9f # lahf
+	flag_cf=0 flag_sf=0 flag_pf=0
+	exec_insn 9e # sahf
+	check_flags "CF=1 ZF=0 SF=1 PF=1"
+
+	# stmxcsr / ldmxcsr / mfence
+	exec_insn 0f ae 1c 25 40 94 00 00 # stmxcsr 0x9440
+	check "mxcsr" $(get_memory 4 $((0x9440))) $((0x1f80))
+	exec_insn 0f ae f0 # mfence
+}
+
+function test_sse2() {
+	current_test=sse2
+
+	# movdqa / movdqu / movups / XMM8-XMM15 with REX
+	set_memory 8 $((0x9600)) $((0x0807060504030201))
+	set_memory 8 $((0x9608)) $((0x100f0e0d0c0b0a09))
+	set_regs RDI $((0x9600)) RSI $((0x9620))
+	exec_insn f3 0f 6f 07    # movdqu (%rdi), %xmm0
+	check_xmm 0 $((0x0807060504030201)) $((0x100f0e0d0c0b0a09))
+	exec_insn 66 44 0f 6f 0f # movdqa (%rdi), %xmm9
+	check_xmm 9 $((0x0807060504030201)) $((0x100f0e0d0c0b0a09))
+	exec_insn 66 44 0f 7f 0e # movdqa %xmm9, (%rsi)
+	check "movdqa store lo" $(get_memory 8 $((0x9620))) $((0x0807060504030201))
+	check "movdqa store hi" $(get_memory 8 $((0x9628))) $((0x100f0e0d0c0b0a09))
+
+	# movsd / movss: memory loads zero upper bits; reg-to-reg preserves upper bits!
+	xmm_lo[1]=$((0xaaaaaaaaaaaaaaaa)) xmm_hi[1]=$((0xbbbbbbbbbbbbbbbb))
+	exec_insn f2 0f 10 0f # movsd (%rdi), %xmm1 (mem -> zeroes hi)
+	check_xmm 1 $((0x0807060504030201)) 0
+	xmm_hi[1]=$((0xbbbbbbbbbbbbbbbb))
+	xmm_lo[2]=$((0x1111222233334444)) xmm_hi[2]=$((0xcccccccccccccccc))
+	exec_insn f2 0f 10 ca # movsd %xmm2, %xmm1 (reg -> preserves hi)
+	check_xmm 1 $((0x1111222233334444)) $((0xbbbbbbbbbbbbbbbb))
+	xmm_lo[2]=$((0x99999999deadbeef))
+	exec_insn f3 0f 10 ca # movss %xmm2, %xmm1 (reg -> copies low 32b only)
+	check_xmm 1 $((0x11112222deadbeef)) $((0xbbbbbbbbbbbbbbbb))
+	exec_insn f3 0f 10 0f # movss (%rdi), %xmm1 (mem -> zeroes 32..127)
+	check_xmm 1 $((0x04030201)) 0
+
+	# movq / movd with 66 + REX.W prefix ordering (66 48 0f 6e / 7e)
+	set_regs RAX $((0xfedcba9876543210))
+	xmm_hi[3]=-1
+	exec_insn 66 48 0f 6e d8 # movq %rax, %xmm3
+	check_xmm 3 $((0xfedcba9876543210)) 0
+	set_regs RBX 0
+	exec_insn 66 48 0f 7e db # movq %xmm3, %rbx
+	check_reg RBX $((0xfedcba9876543210))
+	exec_insn 66 0f 7e da # movd %xmm3, %edx (zeroes upper 32b)
+	check_reg RDX $((0x76543210))
+
+	# movhps / movlps / movlhps / movhlps / movddup
+	xmm_lo[4]=$((0x1111111111111111)) xmm_hi[4]=$((0x2222222222222222))
+	exec_insn 0f 16 27 # movhps (%rdi), %xmm4
+	check_xmm 4 $((0x1111111111111111)) $((0x0807060504030201))
+	exec_insn 0f 12 67 08 # movlps 8(%rdi), %xmm4
+	check_xmm 4 $((0x100f0e0d0c0b0a09)) $((0x0807060504030201))
+	exec_insn f2 0f 12 e4 # movddup %xmm4, %xmm4
+	check_xmm 4 $((0x100f0e0d0c0b0a09)) $((0x100f0e0d0c0b0a09))
+
+	# pxor / por / pand / pandn
+	exec_insn 66 0f ef c0 # pxor %xmm0, %xmm0
+	check_xmm 0 0 0
+	xmm_lo[0]=$((0xff00ff00ff00ff00)) xmm_hi[0]=$((0x00ff00ff00ff00ff))
+	xmm_lo[1]=$((0x0f0f0f0f0f0f0f0f)) xmm_hi[1]=$((0x0f0f0f0f0f0f0f0f))
+	exec_insn 66 0f df c1 # pandn %xmm1, %xmm0 (~xmm0 & xmm1)
+	check_xmm 0 $((0x000f000f000f000f)) $((0x0f000f000f000f00))
+	exec_insn 66 0f eb c1 # por %xmm1, %xmm0
+	check_xmm 0 $((0x0f0f0f0f0f0f0f0f)) $((0x0f0f0f0f0f0f0f0f))
+
+	# glibc SSE2 strlen idiom: pxor + pcmpeqb + pmovmskb + bsf
+	put_bytes $((0x9700)) '0123456789ab\0def'
+	set_regs RDI $((0x9700)) RAX -1
+	exec_insn 66 0f ef c0 # pxor %xmm0, %xmm0
+	exec_insn f3 0f 6f 0f # movdqu (%rdi), %xmm1
+	exec_insn 66 0f 74 c8 # pcmpeqb %xmm0, %xmm1
+	exec_insn 66 0f d7 c1 # pmovmskb %xmm1, %eax
+	check_reg RAX $((1 << 12))
+	exec_insn 0f bc c0    # bsf %eax, %eax
+	check_reg RAX 12
+
+	# pminub / pmaxub / paddb / psubb / paddq / psubq
+	xmm_lo[0]=$((0x0080ff1005040302)) xmm_hi[0]=$((0x1020304050607080))
+	xmm_lo[1]=$((0x0180fe2005010900)) xmm_hi[1]=$((0x1510352055407560))
+	exec_insn 66 0f da c1 # pminub %xmm1, %xmm0
+	check_xmm 0 $((0x0080fe1005010300)) $((0x1010302050407060))
+	exec_insn 66 0f f8 c1 # psubb %xmm1, %xmm0
+	check_xmm 0 $((0xff0000f00000fa00)) $((0xfb00fb00fb00fb00))
+	xmm_lo[2]=-1 xmm_hi[2]=10
+	xmm_lo[3]=2 xmm_hi[3]=32
+	exec_insn 66 0f d4 d3 # paddq %xmm3, %xmm2
+	check_xmm 2 1 42
+
+	# punpcklbw / punpcklqdq / pshufd
+	xmm_lo[0]=$((0x0807060504030201)) xmm_hi[0]=0
+	xmm_lo[1]=$((0xf8f7f6f5f4f3f2f1)) xmm_hi[1]=0
+	exec_insn 66 0f 60 c1 # punpcklbw %xmm1, %xmm0
+	check_xmm 0 $((0xf404f303f202f101)) $((0xf808f707f606f505))
+	xmm_lo[0]=$((0x1111111122222222)) xmm_hi[0]=$((0x3333333344444444))
+	exec_insn 66 0f 70 c8 1b # pshufd $0x1b, %xmm0, %xmm1 (reverse 4 dwords)
+	check_xmm 1 $((0x4444444433333333)) $((0x2222222211111111))
+	exec_insn 66 0f 6c c1 # punpcklqdq %xmm1, %xmm0
+	check_xmm 0 $((0x1111111122222222)) $((0x4444444433333333))
+
+	# Byte shifts pslldq / psrldq across 64-bit lane boundary, plus psllq / psrlq
+	xmm_lo[0]=$((0x0807060504030201)) xmm_hi[0]=$((0x100f0e0d0c0b0a09))
+	exec_insn 66 0f 73 f8 03 # pslldq $3, %xmm0 (shifts out 10,0f,0e)
+	check_xmm 0 $((0x0504030201000000)) $((0x0d0c0b0a09080706))
+	exec_insn 66 0f 73 d8 03 # psrldq $3, %xmm0
+	check_xmm 0 $((0x0807060504030201)) $((0x0000000d0c0b0a09))
+	exec_insn 66 0f 73 f8 0a # pslldq $10, %xmm0 (>= 8 bytes)
+	check_xmm 0 0 $((0x0605040302010000))
+	exec_insn 66 0f 73 d8 0a # psrldq $10, %xmm0 (>= 8 bytes)
+	check_xmm 0 $((0x0000060504030201)) 0
+
+	xmm_lo[0]=-1 xmm_hi[0]=$((0x8000000000000000))
+	exec_insn 66 0f 73 d0 04 # psrlq $4, %xmm0 (must zero-shift, not sign-extend!)
+	check_xmm 0 $((0x0fffffffffffffff)) $((0x0800000000000000))
+	exec_insn 66 0f 73 f0 04 # psllq $4, %xmm0
+	check_xmm 0 $((-16)) $((0x8000000000000000))
+
+	# XMM shift by XMM count >= 64 -> 0
+	xmm_lo[1]=64 xmm_hi[1]=0
+	exec_insn 66 0f d3 c1 # psrlq %xmm1, %xmm0
+	check_xmm 0 0 0
+
+	# Word/dword shifts, compares, pinsrw/pextrw, movmskps/pd
+	xmm_lo[0]=$((0x80007fff0001fffe)) xmm_hi[0]=0
+	exec_insn 66 0f 71 e0 04 # psraw $4, %xmm0
+	check_xmm 0 $((0xf80007ff0000ffff)) 0
+
+	set_regs RAX $((0xabcd))
+	exec_insn 66 0f c4 c0 05 # pinsrw $5, %eax, %xmm0
+	exec_insn 66 0f c5 d0 05 # pextrw $5, %xmm0, %edx
+	check_reg RDX $((0xabcd))
+
+	xmm_lo[0]=$((0x8000000000000001)) xmm_hi[0]=$((0x7fffffff80000000))
+	exec_insn 0f 50 c0 # movmskps %xmm0, %eax (dwords 1 and 2 negative -> 0b0110 = 6)
+	check_reg RAX 6
+	exec_insn 66 0f 50 c0 # movmskpd %xmm0, %eax (qword 0 negative -> 0b01 = 1)
+	check_reg RAX 1
+}
+
 function run_tests() {
 	info "Running self tests."
 	init
@@ -1093,6 +1509,11 @@ function run_tests() {
 	test_control_flow
 	test_stack
 	test_nops_and_strings
+	test_tls_and_addr32
+	test_system_and_atomic
+	test_bit_ops
+	test_strings_and_misc
+	test_sse2
 	info "done."
 }
 

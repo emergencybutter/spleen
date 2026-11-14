@@ -52,24 +52,38 @@ The loader sets `GLOBAL_os_abi` to `macos` or `linux` so that the syscall emulat
 
 ## Supported instructions
 
-Spleen implements the integer subset of x86_64 typically emitted by a C compiler
-(`-O0`, `-O1`, `-Os`, no SSE/x87):
+Spleen implements the x86_64 integer instruction set and SSE/SSE2 SIMD subset used by C compilers, `glibc` and Linux binaries:
 
 * Arithmetic/logic: `add`, `or`, `adc`, `sbb`, `and`, `sub`, `xor`, `cmp` in all
   their encodings (`00`-`3D`, `80`/`81`/`83`), `test`, `inc`, `dec`, `neg`, `not`,
   `mul`, `imul` (1, 2 and 3 operands), `div`, `idiv` (including 128 bit dividends).
+* Atomic & byte-order: `cmpxchg`, `xadd`, `xchg`, `bswap` (`lock` prefix accepted).
 * Shifts and rotates: `shl`/`sal`, `shr`, `sar`, `rol`, `ror`, `rcl`, `rcr`, `shld`, `shrd`.
-* Bit scan: `bsf`, `bsr`.
-* Data movement: `mov` (all forms, including `movabs`), `movzx`, `movsx`, `movsxd`,
-  `lea`, `push`, `pop`, `xchg`, `cbw`/`cwde`/`cdqe`, `cwd`/`cdq`/`cqo`, `cmovcc`, `setcc`,
-  `movs` and `stos` (with `rep`).
-* Control flow: `jmp` (rel8, rel32, indirect), `jcc` (rel8, rel32), `call` (rel32,
-  indirect), `ret`, `leave`.
-* Misc: `nop` (including multi-byte `0f 1f` forms), `endbr64`, `syscall`, `clc`, `stc`,
-  `cmc`, `cld`, `std`.
+* Bit scan & manipulation: `bsf`, `bsr`, `tzcnt`, `lzcnt`, `popcnt`, `bt`, `bts`, `btr`, `btc` (register, immediate and signed-offset memory bitstrings).
+* Data movement & strings: `mov` (all forms, including `movabs` immediate and `moffs`),
+  `movzx`, `movsx`, `movsxd`, `lea`, `push`, `pop`, `pushfq`, `popfq`, `lahf`, `sahf`,
+  `xlatb`, `cbw`/`cwde`/`cdqe`, `cwd`/`cdq`/`cqo`, `cmovcc`, `setcc`, and string
+  operations `movs`, `stos`, `lods`, `cmps`, `scas` (with `rep`, `repe`/`repz`, `repne`/`repnz`).
+* Control flow: `jmp` (rel8, rel32, indirect), `jcc` (rel8, rel32), `jrcxz`/`jecxz`,
+  `loop`/`loope`/`loopne`, `call` (rel32, indirect), `ret`, `enter`, `leave`.
+* SSE / SSE2 (`XMM0`-`XMM15`, 128-bit):
+  * Moves: `movdqa`, `movdqu`, `movaps`/`movapd`, `movups`/`movupd`, `movntps`/`movntpd`,
+    `movntdq`, `lddqu`, `movss`, `movsd`, `movd`, `movq`, `movlps`/`movlpd`, `movhps`/`movhpd`,
+    `movlhps`, `movhlps`, `movddup`, `movsldup`, `movshdup`, `pinsrw`, `pextrw`.
+  * Bitwise & shuffles: `pand`, `pandn`, `por`, `pxor`, `andps`/`pd`, `andnps`/`pd`,
+    `orps`/`pd`, `xorps`/`pd`, `punpcklbw`/`lwd`/`ldq`/`lqdq`, `punpckhbw`/`hwd`/`hdq`/`hqdq`,
+    `unpcklps`/`pd`, `unpckhps`/`pd`, `pshufd`, `pshuflw`, `pshufhw`, `shufps`/`shufpd`.
+  * Shifts, compares, masks & packed integer math: `psrlw`/`d`/`q`, `psraw`/`d`,
+    `psllw`/`d`/`q`, `psrldq`, `pslldq`, `pcmpeqb`/`w`/`d`, `pcmpgtb`/`w`/`d`,
+    `pmovmskb`, `movmskps`/`pd`, `paddb`/`w`/`d`/`q`, `psubb`/`w`/`d`/`q`,
+    `paddusb`, `psubusb`, `pminub`, `pmaxub`.
+* System & misc: `syscall`, `cpuid` (baseline x86_64 + SSE2), `rdtsc`, `rdtscp`, `xgetbv`,
+  `ldmxcsr`/`stmxcsr`, `lfence`/`mfence`/`sfence`/`clflush`, `rdfsbase`/`rdgsbase`/`wrfsbase`/`wrgsbase`,
+  `nop` (including multi-byte `0f 1f` forms), `endbr64`, `ud2`, `hlt`, `int3`, `clc`, `stc`, `cmc`, `cld`, `std`.
 * Flags: CF, PF, AF, ZF, SF, OF are computed (DF is honored by string instructions).
-* Addressing: all ModRM/SIB forms, RIP-relative addressing, REX prefixes, 8-bit
-  registers (`AH`-`BH` without REX, `SPL`-`DIL` with REX), operand size prefix.
+* Addressing: all ModRM/SIB forms, RIP-relative addressing, `%fs:`/`%gs:` TLS segment
+  overrides (`GLOBAL_fs_base`/`GLOBAL_gs_base`), `0x67` 32-bit address-size override,
+  REX prefixes, 8-bit registers (`AH`-`BH` without REX, `SPL`-`DIL` with REX), operand size prefix.
 
 `run-tests.bash` contains unit tests for these instructions. For reference, here is
 the example program that `spleen.bash` runs:
