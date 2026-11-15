@@ -7,6 +7,28 @@ Spleen is a x86_64 CPU emulator written in bash.
 Spleen is a bash script that loads an x86_64 OSX (Mach-O) or Linux (ELF) binary from disk and run the binary without executing native code on host machine.
 Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
 
+## Demo
+
+Running `/bin/bash --version` inside Spleen (Bash emulating an x86_64 CPU running `/bin/bash` — takes **~21 minutes 39 seconds**):
+
+```shell
+$ time bash ./spleen.bash /bin/bash --version
+GNU bash, version 5.2.15(1)-release (x86_64-pc-linux-gnu)
+Copyright (C) 2022 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+
+This is free software; you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+real    21m39s
+```
+
+**What happens under the hood:**
+1. **ELF & interpreter loading**: The host `bash` process runs `spleen.bash`, which reads `/bin/bash` (`ET_DYN` PIE ELF) via `hexdump`/`od` and maps its `PT_LOAD` segments into a Bash integer array (`memory`) at `0x555555554000`. Because `/bin/bash` has a `PT_INTERP` header, Spleen also loads the dynamic linker (`/lib64/ld-linux-x86-64.so.2`) at `0x7ffff7fc0000`.
+2. **SysV stack & auxv setup**: Spleen builds the initial stack at `0x7fffffffe000` with `argc=2`, `argv=("/bin/bash", "--version")`, an empty `envp`, and the ELF auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, etc.), then sets `rip` to the dynamic linker's entry point.
+3. **Dynamic linking & libc init**: Stepping instruction by instruction in pure Bash (including integer ops, SSE2 string routines, and TLS via `%fs`), Spleen emulates the Linux syscalls (`openat`, `fstat`, `read`, `mmap`, `arch_prctl`, `brk`, `getrandom`, etc.) that `ld-linux` uses to locate, map, and relocate shared libraries (`libtinfo`, `libc`, etc.) and run `glibc` startup code.
+4. **Execution & exit**: Control jumps to `/bin/bash`'s entry point, which parses `--version`, writes the version banner to file descriptor 1 via the emulated `write` syscall, and terminates via `exit_group`.
+
 ## Example
 
 ```shell
