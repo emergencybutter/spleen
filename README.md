@@ -1,11 +1,11 @@
 # Spleen - An x86_64 emulator written in bash
 
-Spleen is a x86_64 CPU emulator written in bash.
+Spleen is an x86_64 CPU emulator written in bash.
 
 ## Overview
 
-Spleen is a bash script that loads an x86_64 OSX (Mach-O) or Linux (ELF) binary from disk and run the binary without executing native code on host machine.
-Consequently, you should be able to run the provided example binary on other hosts that have bash installed, such as most of the linux distributions out there.
+Spleen is a bash script that loads an x86_64 OSX (Mach-O) or Linux (ELF) binary from disk and runs the binary without executing native code on the host machine.
+Consequently, you can run the provided example binaries (including the OSX Mach-O binary on Linux) as well as real statically or dynamically linked Linux x86_64 binaries on any host with bash installed.
 
 ## Demo
 
@@ -31,19 +31,23 @@ real    21m39s
 
 ## Usage
 
+* Run a binary (and optional arguments) with:
+
+  `bash ./spleen.bash <binary> [args...]`
+
 * Run the provided examples with:
 
-`` ` ./run-examples.sh` ``
+  `./run-examples.sh`
 
 * Rebuild the examples with the command below. The Mach-O examples (`examples/*.c`) are only built on an OSX machine,
   the Linux ELF examples (`examples/*.S`) are built with `cc -nostdlib -static -no-pie` on Linux
   (or with the cross compiler given in `LINUX_CC`):
 
-`` ` ./gen-examples.sh` ``
+  `./gen-examples.sh`
 
 * Run tests with:
 
-`` ` ./run-tests.bash` ``
+  `./run-tests.bash`
 
 ## Supported binary formats
 
@@ -53,7 +57,7 @@ The format is detected from the magic number of the binary.
 * **ELF** (`0x7f 'E' 'L' 'F'`): `ELFCLASS64`, little endian, `EM_X86_64` executables.
   * `ET_EXEC` binaries are loaded at their link addresses; `ET_DYN` (PIE / static-pie) binaries at the fixed base `0x555555554000`.
   * Every `PT_LOAD` segment is mapped at `load_base + p_vaddr` (`p_filesz` bytes copied from the file, zero filled up to `p_memsz`).
-  * For binaries without `PT_INTERP` (such as `-static-pie` / `ET_DYN` images), the loader parses `PT_DYNAMIC` and applies `DT_RELR`, `DT_RELA` and `DT_JMPREL` relocations (`R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_PC32`/`PLT32`, `R_X86_64_32`/`32S`, `R_X86_64_COPY`).
+  * For binaries without `PT_INTERP` (such as `-static-pie` / `ET_DYN` images), the loader parses `PT_DYNAMIC` and applies `DT_RELR`, `DT_RELA` and `DT_JMPREL` relocations (`R_X86_64_RELATIVE`, `R_X86_64_64`, `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT`, `R_X86_64_PC32`/`PLT32`, `R_X86_64_32`/`32S`, `R_X86_64_COPY`, `R_X86_64_IRELATIVE`).
   * Dynamically linked binaries with a `PT_INTERP` program header are supported: the main executable is mapped at `0x555555554000` (if `ET_DYN`), the dynamic linker (e.g. `/lib64/ld-linux-x86-64.so.2`) is mapped at `0x7ffff7fc0000`, `AT_BASE` is set to the interpreter base while `AT_ENTRY`/`AT_PHDR` describe the main executable, and execution starts at the interpreter entry point so `_dl_start` relocates and links shared libraries at runtime.
   * The initial stack follows the SysV ABI (at `0x7fffffffe000`): `argc`, `argv` (the binary path and extra arguments given to `spleen.bash`),
     an empty `envp` and an auxiliary vector (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_UID`/`AT_EUID`, `AT_GID`/`AT_EGID`, `AT_RANDOM`, `AT_EXECFN`).
@@ -129,14 +133,14 @@ The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `li
 
 * macOS: `write` (0x2000004) and `exit` (0x2000001).
 * Linux x86_64 (number in `rax`, arguments in `rdi rsi rdx r10 r8 r9`, result or negative errno in `rax`, `rcx`/`r11` clobbered):
-  `read` (stdin on fd 0 and open read-only host files on fd >= 3), `pread64`, `write`/`writev` (fd 1 and 2), `open`/`openat` (read-only host files), `close`, `stat`/`fstat`/`lstat`/`newfstatat`, `lseek`, `access`/`faccessat`/`faccessat2`, `fcntl`, `dup`, `getcwd`, `readlink`/`readlinkat`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous and read-only file-backed mappings), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getrlimit`/`prlimit64`, `getpid`, `gettid`, `getppid`, `getpgrp`, `getuid`, `getgid`, `geteuid`, `getegid`, `getresuid`, `getresgid`, `uname`, `arch_prctl` (FS/GS base is only stored), `futex`, `set_tid_address`, `set_robust_list`, `getrandom`, `rseq` (`-ENOSYS`), `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
+  `read` (stdin on fd 0 and open read-only host files on fd >= 3), `pread64`, `write`/`writev` (fd 1 and 2), `open`/`openat` (read-only host files), `close`, `stat`/`fstat`/`lstat`/`newfstatat`, `lseek`, `access`/`faccessat`/`faccessat2`, `fcntl`, `dup`, `getcwd`, `readlink`/`readlinkat`, `brk` (emulated program break starting at `GLOBAL_linux_brk_start`), `mmap` (anonymous and read-only file-backed mappings), `munmap`/`mprotect` (no-ops), `ioctl` (`-ENOTTY`), `rt_sigaction`/`rt_sigprocmask` (no-ops), `getrlimit`/`prlimit64`, `getpid`, `gettid`, `getppid`, `getpgrp`, `getuid`, `getgid`, `geteuid`, `getegid`, `getresuid`, `getresgid`, `uname`, `arch_prctl` (sets/gets `GLOBAL_fs_base`/`GLOBAL_gs_base` for `%fs:`/`%gs:` TLS addressing), `futex`, `set_tid_address`, `set_robust_list`, `getrandom`, `rseq` (`-ENOSYS`), `clock_gettime`, `gettimeofday`, `time`, `exit`, `exit_group`.
   Unimplemented Linux syscalls return `-ENOSYS` (visible with `enable_debug_messages=true`), since libc start-up code probes optional syscalls.
 
 ## Technical notes
 
-* `libx86_64.bash` uses `hexdump` to read the binary and transform it in something bash can load. Bash cannot natively deal with binary files that may have zeros in them. When `hexdump` is not installed, a small shim falls back to POSIX `od`. Apart from that, I don't call external binaries for anything, everything is bash.
-* The RAM is emulated as an array of bytes, which in bash is an array if `integers` which are actually 64 bits, at least on my machine. `` `declare -ra memory` ``.
-* `spleen.bash` uses dynamic scoping. meaning subfunction can alter the local variables of the parent (calling) functions.
+* `libx86_64.bash` uses `hexdump` to read the binary and transform it into something bash can load. Bash cannot natively deal with binary files that may have zeros in them. When `hexdump` is not installed, a small shim falls back to POSIX `od`. Apart from that (and basic coreutils like `stat`, `readlink`, `wc`, `dirname`, and `date` used by the Linux filesystem/time syscalls), all CPU and memory emulation is pure bash.
+* The RAM is emulated as a sparse array of bytes, which in bash is an array of `integers` (64-bit signed integers): `declare -ia memory=()`.
+* `spleen.bash` uses dynamic scoping, meaning subfunctions can alter the local variables of the parent (calling) functions.
 
 ## FAQ
 
@@ -145,9 +149,9 @@ The `syscall` instruction dispatches on `GLOBAL_os_abi` (`macos` by default, `li
 Là, tout n’est qu’ordre et beauté, 
 Luxe, calme et volupté.
 
-### Ok, seriouly though, why?
+### Ok, seriously though, why?
 
-I came across a [awk-jvm](https://github.com/rethab/awk-jvm), a jvm implemented in awk. I chuckled and thought that this was the most useless thing ever made. Unfortunately, I then figured that I could probably write something even more useless. ```can + shouldn't = must```.
+I came across a [awk-jvm](https://github.com/rethab/awk-jvm), a jvm implemented in awk. I chuckled and thought that this was the most useless thing ever made. Unfortunately, I then figured that I could probably write something even more useless. `can + shouldn't = must`.
 
 ### Is everything ok?
 
@@ -159,7 +163,7 @@ Bash 3 or later (the script checks and refuses to run otherwise). I tested with 
 
 ### What else do I need?
 
-Just bash and either `hexdump` or `od` to read the binary. `hexdump` is used when available; on systems without it (e.g. minimal Debian images where it lives in `bsdextrautils`), spleen falls back to `od`, which is part of POSIX coreutils and present pretty much everywhere.
+Just bash and POSIX coreutils (`od` or `hexdump` to read binaries, plus `stat`, `readlink`, `wc`, `dirname`, and `date` when emulating Linux file/time syscalls). `hexdump` is used when available; on systems without it (e.g. minimal Debian images where it lives in `bsdextrautils`), spleen falls back to `od`, which is part of POSIX coreutils and present pretty much everywhere.
 
 ### Why are there binaries in your git repository?
 
