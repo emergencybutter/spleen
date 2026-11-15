@@ -29,17 +29,6 @@ real    21m39s
 3. **Dynamic linking & libc init**: Stepping instruction by instruction in pure Bash (including integer ops, SSE2 string routines, and TLS via `%fs`), Spleen emulates the Linux syscalls (`openat`, `fstat`, `read`, `mmap`, `arch_prctl`, `brk`, `getrandom`, etc.) that `ld-linux` uses to locate, map, and relocate shared libraries (`libtinfo`, `libc`, etc.) and run `glibc` startup code.
 4. **Execution & exit**: Control jumps to `/bin/bash`'s entry point, which parses `--version`, writes the version banner to file descriptor 1 via the emulated `write` syscall, and terminates via `exit_group`.
 
-## Example
-
-```shell
-$ uname -a
-Linux contrib-stretch 4.9.0-12-amd64 #1 SMP Debian 4.9.210-1 (2020-01-20) x86_64 GNU/Linux
-$ file examples-bin/hi 
-examples-bin/hi: Mach-O 64-bit x86_64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE>
-$ bash ./spleen.bash examples-bin/hi
-Hello World!
-```
-
 ## Usage
 
 * Run the provided examples with:
